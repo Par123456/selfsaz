@@ -12,6 +12,7 @@ import shutil
 import signal
 import re
 import os
+import sys
 
 #==================== Config =====================#
 Admin = 6508600903  # آیدی عددی مالک سلف ساز
@@ -20,12 +21,12 @@ API_ID = 29042268  # ایپی ایدی اکانت مالک سلف ساز
 API_HASH = "54a7b377dd4a04a58108639febe2f443"  # ایپی هش اکانت مالک سلف ساز
 Channel_ID = "golden_market7" # چنل سلف ساز بدون @
 Helper_ID = "helperno1_7bot" # ایدی ربات هلپر بدون @
-DBName = "a1176921_self" # نام دیتابیس اول
-DBUser = "a1176921_self" # یوزر دیتابیس اول
-DBPass = "tVls72ob" # پسورد دیتابیس اول
-HelperDBName = "a1176921_self" # نام دیتابیس هلپر
-HelperDBUser = "a1176921_self" # یوزر دیتابیس هلپر
-HelperDBPass = "tVls72ob" # پسورد دیتابیس هلپر
+DBName = "a1176921_no1" # نام دیتابیس اول
+DBUser = "a1176921_no1" # یوزر دیتابیس اول
+DBPass = "xTJJnO04" # پسورد دیتابیس اول
+HelperDBName = "a1176921_no1" # نام دیتابیس هلپر
+HelperDBUser = "a1176921_no1" # یوزر دیتابیس هلپر
+HelperDBPass = "xTJJnO04" # پسورد دیتابیس هلپر
 CardNumber = 6060606060606060 # شماره کارت برای فروش
 CardName = "no1 self" # نام صاحب شماره کارت
 Selfname = "No1 Self" # نام سلف
@@ -979,12 +980,28 @@ async def update(c, m):
                     return
 
                 try:
-                    process = subprocess.Popen(
-                        ["python3.11", "self.py", str(m.chat.id), str(API_ID), API_HASH, Helper_ID], 
-                        cwd=user_self_dir,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE
-                    )
+                    # --- جایگزین بلوک اجرای self.py برای m.chat.id ---
+                   import sys, subprocess, os
+
+                   user_id = m.chat.id
+                   user_self_dir = f"selfs/self-{user_id}"
+                   self_py_path = os.path.join(user_self_dir, "self.py")
+
+                   if API_ID is None or not API_HASH or not Helper_ID:
+                       print(f"[ERROR] credentials missing (API_ID/API_HASH/Helper_ID). aborting for user {user_id}")
+    # در صورت نیاز اینجا پیام به ادمین یا کاربر بفرست
+                   else:
+                       if not os.path.isfile(self_py_path):
+                           print(f"[ERROR] missing {self_py_path} — ensure zip extracted correctly")
+                   else:
+                       cmd = [sys.executable, "self.py", str(user_id), str(API_ID), str(API_HASH), str(Helper_ID)]
+                       print(f"[INFO] running: {cmd} cwd={user_self_dir}")
+                       proc = subprocess.Popen(cmd, cwd=user_self_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                       out, err = proc.communicate(timeout=300)
+                       if out: print(f"[self stdout]\n{out}")
+                       if err: print(f"[self stderr]\n{err}")
+                       print(f"[INFO] self.py exited with code {proc.returncode} for user {user_id}")
+
                     await asyncio.sleep(15)
                     return_code = process.poll()
                     if return_code is None:
@@ -1104,12 +1121,26 @@ async def update(c, m):
                     "لطفاً با پشتیبانی تماس بگیرید."
                 ))
             try:
-                process = subprocess.Popen(
-                    ["python3.11", "self.py", str(m.chat.id), str(API_ID), API_HASH, Helper_ID], 
-                    cwd=user_self_dir,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
+                   import sys, subprocess, os
+
+                   user_id = m.chat.id
+                   user_self_dir = f"selfs/self-{user_id}"
+                   self_py_path = os.path.join(user_self_dir, "self.py")
+
+                   if API_ID is None or not API_HASH or not Helper_ID:
+                       print(f"[ERROR] credentials missing (API_ID/API_HASH/Helper_ID). aborting for user {user_id}")
+    # در صورت نیاز اینجا پیام به ادمین یا کاربر بفرست
+                   else:
+                       if not os.path.isfile(self_py_path):
+                           print(f"[ERROR] missing {self_py_path} — ensure zip extracted correctly")
+                   else:
+                       cmd = [sys.executable, "self.py", str(user_id), str(API_ID), str(API_HASH), str(Helper_ID)]
+                       print(f"[INFO] running: {cmd} cwd={user_self_dir}")
+                       proc = subprocess.Popen(cmd, cwd=user_self_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                       out, err = proc.communicate(timeout=300)
+                       if out: print(f"[self stdout]\n{out}")
+                       if err: print(f"[self stderr]\n{err}")
+                       print(f"[INFO] self.py exited with code {proc.returncode} for user {user_id}")
                 await asyncio.sleep(15)
                 return_code = process.poll()
                 if return_code is None:
@@ -1835,7 +1866,27 @@ async def update(c, m):
 
                     if user_data["self"] != "active":
                         mess = await app.send_message(Admin, "در حال پردازش...\n(ممکن است چند لحظه طول بکشد)")
-                        process = subprocess.Popen(["python3.11", "self.py", str(user_id), str(API_ID), API_HASH, Helper_ID], cwd=f"selfs/self-{user_id}")
+                        # --- جایگزین بلوک اجرای self.py برای متغیر user_id ---
+import sys, subprocess, os
+
+# فرض: user_id از قبل تعریف شده است
+user_self_dir = f"selfs/self-{user_id}"
+self_py_path = os.path.join(user_self_dir, "self.py")
+
+if API_ID is None or not API_HASH or not Helper_ID:
+    print(f"[ERROR] credentials missing (API_ID/API_HASH/Helper_ID). aborting for user {user_id}")
+else:
+    if not os.path.isfile(self_py_path):
+        print(f"[ERROR] missing {self_py_path} — ensure zip extracted correctly")
+    else:
+        cmd = [sys.executable, "self.py", str(user_id), str(API_ID), str(API_HASH), str(Helper_ID)]
+        print(f"[INFO] running: {cmd} cwd={user_self_dir}")
+        proc = subprocess.Popen(cmd, cwd=user_self_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out, err = proc.communicate(timeout=300)
+        if out: print(f"[self stdout]\n{out}")
+        if err: print(f"[self stderr]\n{err}")
+        print(f"[INFO] self.py exited with code {proc.returncode} for user {user_id}")
+
 
                         await asyncio.sleep(10)
                         if process.poll() is None:
