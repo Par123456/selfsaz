@@ -6,7 +6,7 @@
 #MyTeam:@Winston_source
 # ---------------------------------------
 
-WORKDIR="/home/mamad/self"
+WORKDIR="/home/a1176921/selfsaz"
 VENV="$WORKDIR/myenv/bin/activate"
 cd $WORKDIR
 source $VENV
