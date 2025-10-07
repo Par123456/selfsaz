@@ -1005,7 +1005,7 @@ async def update(c, m):
                            print(f"[INFO] self.py exited with code {proc.returncode} for user {user_id}")
 
                    await asyncio.sleep(15)
-                    return_code = process.poll()
+                   return_code = process.poll()
                     if return_code is None:
                         await app.edit_message_text(chat_id, mess.id, (
                             "سلف با موفقیت برای اکانت شما فعال شد\n"
