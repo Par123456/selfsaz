@@ -993,14 +993,16 @@ async def update(c, m):
                    else:
                        if not os.path.isfile(self_py_path):
                            print(f"[ERROR] missing {self_py_path} — ensure zip extracted correctly")
-                   else:
-                       cmd = [sys.executable, "self.py", str(user_id), str(API_ID), str(API_HASH), str(Helper_ID)]
-                       print(f"[INFO] running: {cmd} cwd={user_self_dir}")
-                       proc = subprocess.Popen(cmd, cwd=user_self_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                       out, err = proc.communicate(timeout=300)
-                       if out: print(f"[self stdout]\n{out}")
-                       if err: print(f"[self stderr]\n{err}")
-                       print(f"[INFO] self.py exited with code {proc.returncode} for user {user_id}")
+                       else:
+                           cmd = [sys.executable, "self.py", str(user_id), str(API_ID), str(API_HASH), str(Helper_ID)]
+                           print(f"[INFO] running: {cmd} cwd={user_self_dir}")
+                           proc = subprocess.Popen(cmd, cwd=user_self_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                           out, err = proc.communicate(timeout=300)
+                           if out: 
+                               print(f"[self stdout]\n{out}")
+                           if err: 
+                               print(f"[self stderr]\n{err}")
+                           print(f"[INFO] self.py exited with code {proc.returncode} for user {user_id}")
 
                     await asyncio.sleep(15)
                     return_code = process.poll()
