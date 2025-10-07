@@ -26,8 +26,8 @@ DBPass = "QdsmNHyu" # پسورد دیتابیس اول
 HelperDBName = "a1176814_no1" # نام دیتابیس هلپر
 HelperDBUser = "a1176814_no1" # یوزر دیتابیس هلپر
 HelperDBPass = "QdsmNHyu" # پسورد دیتابیس هلپر
-CardNumber = 0123 # شماره کارت برای فروش
-CardName = "" # نام صاحب شماره کارت
+CardNumber = 6060606060606060 # شماره کارت برای فروش
+CardName = "no1" # نام صاحب شماره کارت
 Selfname = "No1 Self" # نام سلف
 
 Pweek = 7000
