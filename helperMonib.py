@@ -2844,7 +2844,7 @@ async def call(app, call):
                     if action == "persian":
                          await app.edit_inline_text(inline_message_id=call.inline_message_id, text=f"""**╭─────────────────────────╮
 │  🌟 سلام {call.from_user.first_name} عزیز  │
-│ 📚 راهنمای ونوس سلف 📚 │
+│ 📚 راهنمای نو وان سلف 📚 │
 ╰─────────────────────────╯
 
 🎯 لطفاً بخش مورد نظر خود را انتخاب کنید:
@@ -2854,7 +2854,7 @@ async def call(app, call):
                     elif action == "english":
                          await app.edit_inline_text(inline_message_id=call.inline_message_id, text=f"""**╭─────────────────────────╮
 │  🌟 Hello {call.from_user.first_name}!  │
-│ 📚 Wenos Self Helper 📚 │
+│ 📚 No1 Self Helper 📚 │
 ╰─────────────────────────╯
 
 🎯 Please select the section you want:
