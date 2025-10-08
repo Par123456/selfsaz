@@ -8594,8 +8594,8 @@ async def main():
 
 ماچ به لپت! 🍑
 
-👨‍💻سازنده : @Mjrd1388
-🏖چنل : @Atmosphere_Self_Channel
+👨‍💻سازنده : @Anishtayin
+🏖چنل : @golden_market7
 🔄ورژن : 5**""")
         print("Activation message sent.")
     except Exception as e:
