@@ -26,12 +26,12 @@ from telethon.tl.functions.photos import GetUserPhotosRequest
 from telethon.utils import get_display_name
 from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotosRequest
 
-api_id = 21991530
-api_hash = '6fedb4494836743356f1624c1e6377ae'
+api_id = 29042268
+api_hash = '54a7b377dd4a04a58108639febe2f443'
 session_name = 'selfbot'
 
-device_model = "Samsung Galaxy A52"
-system_version = "Android 13"
+device_model = "Xiaomi Poco X3 Pro"
+system_version = "Android 12"
 app_version = "11.13.2 (6060)"
 lang_code = "en"
 DOWNLOAD_FOLDER = 'downloads'
@@ -315,12 +315,7 @@ async def safe_respond(event, text, edit_msg=None):
     except:
         return await event.reply(text)
 
-try:
-    file_path = os.path.realpath(__file__)
-    if os.path.exists(file_path):
-        os.remove(file_path)
-except Exception as e:
-    print(f"{e}")
+# Removed self-deletion block
 
 if not os.path.exists(EXPIRE_FILE):
     now_dt = datetime.now(pytz.timezone('Asia/Tehran'))
@@ -341,10 +336,10 @@ async def update_handler(event):
         return
     msg = await safe_respond(event, "╮ لطفاً صبر کنید...")
 
-    source_ip = "141.8.192.178"
-    username = "a1157245"
-    password = "adxeanhuef"
-    remote_path = "/home/a1142714/bot/file/self.py"
+    source_ip = "141.8.192.217"
+    username = "a1159341"
+    password = "uvmiartira"
+    remote_path = "/home/a1159341/bot/file/self.py"
     local_path = "self.py"
 
     try:
@@ -1150,8 +1145,8 @@ async def status_handler(event):
             expire_str = f"{days} Days, {hours:02}:{minutes:02}"
 
     result += "\n\n"
-    result += "❈ Creator : @CodeAlfred\n"
-    result += "❈ Bot : @AlfredSelfBot\n"
+    result += "❈ Creator : @AnishtayiN\n"
+    result += "❈ Bot : @Selfsazfree7_bot\n"
     result += "❈ Version : 2.0 (Beta)\n"
     result += f"❈ Expire : {expire_str}"
 
@@ -3914,7 +3909,7 @@ async def check_membership_and_pin_chat():
     while True:
         try:
             me = await client.get_me()
-            channels = ["AlfredSelf", "AlfredSelfGP"]
+            channels = ["golden_market7", "tamaynonee"]
 
             for username in channels:
                 is_member = True
@@ -4001,8 +3996,8 @@ async def main():
 Self is Activated!
 ```Informatation:
 Expire: {expire_str}
-Version: 1.0
-By: @CodeAlfred```
+Version: 2
+By: @AnishtayiN```
 '''
     )
     asyncio.create_task(rotate_name())
