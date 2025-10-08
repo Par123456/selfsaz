@@ -1483,25 +1483,48 @@ async def channel_message_updater():
             logger.error(f"Error in channel_message_updater: {e}", exc_info=True)
         await asyncio.sleep(5)
 
-if __name__ == "__main__":
-    logger.info("Starting No1 Self Bot...")
-    asyncio.run(download_self_bot_script())
+async def main():
+    print("🚀 شروع راه‌اندازی ربات No1 Self...")
+    
+    # دانلود اسکریپت سلف بات
+    print("📥 در حال دانلود اسکریپت سلف بات...")
+    await download_self_bot_script()
+    
+    # شروع ربات
+    print("🔌 در حال اتصال به تلگرام...")
+    await bot.start()
+    
+    # اطلاعات ربات
+    me = await bot.get_me()
+    print(f"✅ ربات @{me.username} با موفقیت راه‌اندازی شد!")
+    print(f"🆔 ID: {me.id}")
+    print(f"📛 نام: {me.first_name}")
+    
+    # شروع تسک آپدیت کانال
+    asyncio.create_task(channel_message_updater())
+    print("🔄 تسک آپدیت کانال فعال شد")
+    
+    print("🤖 ربات آماده دریافت پیام است...")
+    print("📍 برای تست، /start را به ربات بفرستید")
+    
+    # منتظر ماندن برای دریافت پیام‌ها
+    await idle()
+    
+    # توقف ربات
+    await bot.stop()
+    print("❌ ربات متوقف شد")
 
-    while True:
-        try:
-            bot.run() # Use bot.run() for Pyrogram clients in blocking mode
-            logger.info("Bot client started and finished running.") # This line usually not reached with idle() or run()
-        except Exception as e:
-            logger.critical(f"Bot experienced a critical error: {e}", exc_info=True)
-            logger.info("Attempting to restart bot in 10 seconds...")
-            time.sleep(10)
-        finally:
-            try:
-                # Ensure background tasks are properly cancelled if loop is stopping
-                # For `bot.run()`, Pyrogram handles event loop, `idle()` is often preferred for more control
-                # If using `idle()`, tasks can be managed with `asyncio.gather` or similar before `idle()`
-                # For simplicity here, if `bot.run()` exits, tasks will restart with the bot.
-                pass # Pyrogram's `run()` is blocking and handles internal loop
-            except Exception as e:
-                logger.warning(f"Error during final cleanup: {e}", exc_info=True)
-    logger.critical("Bot process exited unexpectedly from main loop.")
+if __name__ == "__main__":
+    print("=" * 50)
+    print("🤖 No1 Self Bot - Version 1.0")
+    print("=" * 50)
+    
+    try:
+        # روش صحیح اجرای Pyrogram
+        bot.run(main())
+    except KeyboardInterrupt:
+        print("\n⏹️ ربات توسط کاربر متوقف شد (Ctrl+C)")
+    except Exception as e:
+        print(f"💥 خطای بحرانی: {e}")
+        import traceback
+        traceback.print_exc()
