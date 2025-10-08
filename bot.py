@@ -794,7 +794,7 @@ async def run_self(client: Client, cb):
         if not BOT_ACTIVE and user_id not in OWNER_IDS:
             logger.info(f"Run attempt by {user_id} denied: bot is inactive.")
             return await cb.answer("ربات خاموش است!", show_alert=True)
-
+    try:
         now = datetime.now(timezone("Asia/Tehran"))
         # Per-user 24-hour cooldown
         if user_id not in OWNER_IDS:
