@@ -39,9 +39,9 @@ Helper_ID = "helperno1_7bot"  # ایدی ربات هلپر بدون @
 # Database configuration (assuming both main and helper databases are the same instance and credentials)
 # In a real-world scenario, if 'HelperDB' is truly separate, it would need its own distinct host/credentials.
 DB_HOST = "localhost" # It's critical this is 'localhost' if running on the same server, or the actual IP/hostname.
-DBName = "a1176921_self1"  # نام دیتابیس اول
-DBUser = "a1176921_self1"  # یوزر دیتابیس اول
-DBPass = "19Nhexu0"  # پسورد دیتابیس اول
+DBName = "a1177096_self"  # نام دیتابیس اول
+DBUser = "a1177096_self"  # یوزر دیتابیس اول
+DBPass = "Wo0jwW3u"  # پسورد دیتابیس اول
 
 CardNumber = 6060606060606060  # شماره کارت برای فروش
 CardName = "no1 self"  # نام صاحب شماره کارت
