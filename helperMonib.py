@@ -16,9 +16,9 @@ owner = 6508600903 # ایدی عددی مالک سلف ساز
 api_id = 29042268 # ایپی ایدی مالک سلف ساز 
 api_hash = "54a7b377dd4a04a58108639febe2f443" # ایپی هش مالک سلف ساز
 bot_token = "8156078217:AAE-iIBpwWBXE3XhyVy24uHduTB5CKNOXME" # توکن ربات هلپر 
-DBName = "a1176921_self1" # نام دیتابیس هلپر 
-DBUser = "a1176921_self1" # یوزر دیتابیس هلپر 
-DBPass = "19Nhexu0" # پسورد دیتابیس هلپر
+DBName = "a1177096_self" # نام دیتابیس هلپر 
+DBUser = "a1177096_self" # یوزر دیتابیس هلپر 
+DBPass = "Wo0jwW3u" # پسورد دیتابیس هلپر
 #==========================================#
 
 def get_data(query, params=None):
