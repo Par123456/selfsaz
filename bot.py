@@ -257,11 +257,11 @@ async def update_channel_message(retries=3):
             else:
                 message_text += ":)\n"
 
-            message_text += "@@no1selfbot"
+            message_text += "@no1selfbot"
 
             await bot.edit_message_text(
                 chat_id=CHANNEL_ID,
-                message_id=94,
+                message_id=1,
                 text=message_text
             )
             return
