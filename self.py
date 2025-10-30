@@ -26,8 +26,8 @@ from telethon.tl.functions.photos import GetUserPhotosRequest
 from telethon.utils import get_display_name
 from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotosRequest
 
-api_id = 29042268
-api_hash = '54a7b377dd4a04a58108639febe2f443'
+api_id = 
+api_hash = ''
 session_name = 'selfbot'
 
 device_model = "Xiaomi Poco X3 Pro"
